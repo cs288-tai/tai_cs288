@@ -139,3 +139,151 @@ cython_debug/
 
 # Claude Code session reports (private development session information)
 .claude/jobs/
+
+############################
+# Project-specific
+############################
+
+# Ignore all docs + data by default
+docs/
+data/
+
+# Keep folder placeholders (optional)
+!docs/.gitkeep
+!data/.gitkeep
+
+# Common derived artifacts you might have
+artifacts/
+outputs/
+results/
+runs/
+logs/
+tmp/
+temp/
+cache/
+.checkpoints/
+
+# Model / embedding / vector stores
+*.faiss
+*.index
+*.ann
+*.hnsw
+*.sqlite
+*.sqlite3
+*.db
+*.duckdb
+*.parquet
+*.arrow
+
+# Large slide/image/video/audio assets (often too big)
+*.pdf
+*.ppt
+*.pptx
+*.key
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.wav
+*.mp3
+*.m4a
+
+# Datasets / archives
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+*.gz
+
+############################
+# Secrets / env
+############################
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+secrets.*
+credentials.*
+config.local.*
+*.local.json
+
+############################
+# Python
+############################
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+pip-wheel-metadata/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.pytype/
+.ruff_cache/
+.pyre/
+.ipynb_checkpoints/
+.venv/
+venv/
+ENV/
+env/
+
+############################
+# Jupyter / notebooks
+############################
+*.ipynb~ 
+
+############################
+# Node / JS
+############################
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+dist/
+build/
+.next/
+out/
+.turbo/
+.eslintcache
+
+############################
+# IDE / OS
+############################
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+
+.vscode/
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/launch.json
+!.vscode/tasks.json
+
+.idea/
+*.iml
+
+############################
+# Misc
+############################
+*.log
+*.tmp
+*.swp
+*.swo
+*.bak
+*.orig
