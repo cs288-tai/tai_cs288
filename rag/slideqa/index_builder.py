@@ -22,6 +22,10 @@ logger = logging.getLogger(__name__)
 _MAX_TEXT_CHARS = 32_000
 
 SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS slide_pages (
     page_id TEXT PRIMARY KEY, course_code TEXT NOT NULL, lecture_id TEXT NOT NULL,
     page_number INTEGER NOT NULL, image_path TEXT NOT NULL,
@@ -109,6 +113,11 @@ def upsert_page_records(db_path: Path, records: list[SlidePageRecord]) -> int:
               objects     = excluded.objects
             """,
             rows,
+        )
+        # Bump meta timestamp so Retriever cache invalidates cross-process
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) "
+            "VALUES ('last_modified', strftime('%Y-%m-%dT%H:%M:%f', 'now'))"
         )
         conn.commit()
         logger.info("Upserted %d page records", len(rows))
@@ -246,6 +255,11 @@ def build_embeddings(
             VALUES (?, ?, ?)
             """,
             rows,
+        )
+        # Bump meta timestamp so Retriever cache invalidates cross-process
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) "
+            "VALUES ('last_modified', strftime('%Y-%m-%dT%H:%M:%f', 'now'))"
         )
         conn.commit()
         logger.info("Stored %d embeddings (variant=%s)", len(rows), variant)

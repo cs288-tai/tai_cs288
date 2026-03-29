@@ -3,6 +3,7 @@ from app.api.routes import (
     courses,
     files,
     problems,
+    slideqa,
 )
 from fastapi import APIRouter
 
@@ -23,3 +24,6 @@ api_router.include_router(files.router, prefix="/files", tags=["files"])
 # Problems management
 api_router.include_router(
     problems.router, prefix="/problems", tags=["problems"])
+
+# SlideQA
+api_router.include_router(slideqa.router, prefix="/slideqa", tags=["slideqa"])
