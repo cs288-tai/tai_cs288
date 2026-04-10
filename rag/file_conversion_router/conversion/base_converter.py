@@ -176,6 +176,54 @@ class BaseConverter(ABC):
         logger.info("✅ Successfully converted page content to chunks.")
         return chunks, metadata
 
+    def generate_slideqa_for_chunks(
+        self,
+        chunks: List[Chunk],
+        variant_md_path: Path,
+        variant: str,
+    ) -> None:
+        """Generate SlideQA pairs (types i–v) per chunk and write a .qa.jsonl sidecar.
+
+        Must be called explicitly by the caller (e.g. pipeline script) after
+        converting each variant markdown, passing the variant markdown path and
+        variant label directly — not inferred from input_path.
+
+        Args:
+            chunks:          Chunks produced by page.to_chunk() for this variant.
+            variant_md_path: Path to the variant markdown (e.g. lecture01.v2.md).
+                             The sidecar is written as lecture01.v2.qa.jsonl.
+            variant:         One of "v1", "v2", "v3".
+
+        Output: <variant_md_path stem>.qa.jsonl next to variant_md_path.
+        Idempotent: skips if sidecar already exists.
+        """
+        import json as _json
+
+        out_path = variant_md_path.with_suffix(".qa.jsonl")
+        if out_path.exists():
+            logger.info("SlideQA sidecar already exists, skipping: %s", out_path)
+            return
+
+        all_pairs: List[dict] = []
+        for chunk in chunks:
+            chunk_id = str(chunk.chunk_uuid or "unknown")
+            # chunk.index == page_idx from MinerU (0-based page number of the slide)
+            page_id = int(chunk.index) if chunk.index is not None else 0
+            pairs = get_slideqa_pairs_for_chunk(
+                chunk_text=chunk.content,
+                chunk_id=chunk_id,
+                page_id=page_id,
+                variant=variant,
+            )
+            all_pairs.extend(pairs)
+
+        if not all_pairs:
+            return
+
+        lines = [_json.dumps(p, ensure_ascii=False) for p in all_pairs]
+        out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        logger.info("Wrote %d SlideQA pairs to %s", len(all_pairs), out_path)
+
     def _to_page(self, input_path: Path, output_path: Path) -> Tuple[Page, dict]:
         """Convert the input file to a Page object and return it along with metadata."""
         # Ensure the output directory exists

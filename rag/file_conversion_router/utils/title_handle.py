@@ -1602,6 +1602,118 @@ def remove_invalid_concepts(
     return processor.remove_invalid_concepts(content_dict, title_list)
 
 
+# ========================
+# SlideQA Chunk-Level QA Generation
+# ========================
+
+_SLIDEQA_VALID_QUESTION_TYPES = frozenset(
+    {"type_i", "type_ii", "type_iii", "type_iv", "type_v"}
+)
+_SLIDEQA_REQUIRED_KEYS = frozenset(
+    {"question_text", "answer", "question_type", "evidence_modality"}
+)
+
+_SLIDEQA_PROMPT_TEMPLATE = """\
+You are an expert educator creating a question-answer dataset from a single chunk \
+of lecture slide content.
+
+Chunk content (index variant: {variant}):
+```
+{chunk_text}
+```
+
+Generate QA pairs covering ALL five question types listed below. \
+Skip a type only if the chunk contains absolutely no relevant content for it.
+
+  - type_i  (text-only): answerable from slide text alone.
+  - type_ii (image-dependent / diagram): requires interpreting a diagram or figure.
+  - type_iii (table-centric): requires reading or comparing table values.
+  - type_iv (chart/graph): about chart trends, axis values, or legend.
+  - type_v  (layout-dependent): about spatial relationships in multi-panel layouts.
+
+Rules:
+1. Each answer must be grounded in the chunk content.
+2. gold_chunk_ids must be an empty list []; the caller will fill in the real chunk IDs.
+3. Return ONLY a JSON array — no markdown fences, no extra keys.
+
+JSON schema for each element:
+[
+  {{
+    "question_text": "string",
+    "answer": "string",
+    "question_type": "type_i | type_ii | type_iii | type_iv | type_v",
+    "evidence_modality": "text_only | visual | table | chart | layout",
+    "gold_chunk_ids": []
+  }}
+]
+"""
+
+
+def get_slideqa_pairs_for_chunk(
+    chunk_text: str,
+    chunk_id: str,
+    page_id: int,
+    variant: str,
+) -> List[Dict[str, Any]]:
+    """Generate SlideQA pairs (types i–v) for one chunk of slide content.
+
+    Each returned dict has:
+        question_text, answer, question_type, evidence_modality,
+        gold_chunk_ids, chunk_id, page_id, variant
+
+    gold_chunk_ids is seeded with [chunk_id] so downstream evaluation has
+    a ready-made gold target; the caller may enrich it further.
+
+    Returns [] when:
+    - OPENAI_API_KEY is not available
+    - The model returns malformed JSON
+    - Any API exception occurs
+    """
+    api_key = get_openai_api_key()
+    if not api_key:
+        logger.info("OPENAI_API_KEY not set; skipping SlideQA generation for chunk %s.", chunk_id)
+        return []
+
+    client = OpenAI(api_key=api_key)
+    prompt = _SLIDEQA_PROMPT_TEMPLATE.format(variant=variant, chunk_text=chunk_text)
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=2000,
+        )
+        raw = (response.choices[0].message.content or "").strip()
+        pairs = json.loads(raw)
+        if not isinstance(pairs, list):
+            logger.warning("SlideQA response was not a JSON array for chunk %s.", chunk_id)
+            return []
+    except json.JSONDecodeError as exc:
+        logger.warning("SlideQA malformed JSON for chunk %s: %s", chunk_id, exc)
+        return []
+    except Exception as exc:
+        logger.warning("SlideQA API call failed for chunk %s: %s", chunk_id, exc)
+        return []
+
+    enriched: List[Dict[str, Any]] = []
+    for pair in pairs:
+        if not isinstance(pair, dict):
+            continue
+        if not _SLIDEQA_REQUIRED_KEYS <= set(pair.keys()):
+            logger.warning("SlideQA pair missing required keys, dropping: %s", list(pair.keys()))
+            continue
+        if pair.get("question_type") not in _SLIDEQA_VALID_QUESTION_TYPES:
+            logger.warning("SlideQA pair has invalid question_type %r, dropping.", pair.get("question_type"))
+            continue
+        pair["gold_chunk_ids"] = [chunk_id]
+        pair["chunk_id"] = chunk_id
+        pair["page_id"] = page_id
+        pair["variant"] = variant
+        enriched.append(pair)
+
+    return enriched
+
+
 def fix_title_levels(mapping_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Fix title levels to ensure they are sequential.
