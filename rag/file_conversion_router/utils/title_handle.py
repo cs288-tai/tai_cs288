@@ -1603,7 +1603,7 @@ def remove_invalid_concepts(
 
 
 # ========================
-# SlideQA Chunk-Level QA Generation
+# SlideQA Page-Level QA Generation
 # ========================
 
 _SLIDEQA_VALID_QUESTION_TYPES = frozenset(
@@ -1614,16 +1614,16 @@ _SLIDEQA_REQUIRED_KEYS = frozenset(
 )
 
 _SLIDEQA_PROMPT_TEMPLATE = """\
-You are an expert educator creating a question-answer dataset from a single chunk \
-of lecture slide content.
+You are an expert educator creating a question-answer dataset from a single \
+lecture slide page.
 
-Chunk content (index variant: {variant}):
+Page content (index variant: {variant}):
 ```
-{chunk_text}
+{page_text}
 ```
 
 Generate QA pairs covering ALL five question types listed below. \
-Skip a type only if the chunk contains absolutely no relevant content for it.
+Skip a type only if the page contains absolutely no relevant content for it.
 
   - type_i  (text-only): answerable from slide text alone.
   - type_ii (image-dependent / diagram): requires interpreting a diagram or figure.
@@ -1632,8 +1632,8 @@ Skip a type only if the chunk contains absolutely no relevant content for it.
   - type_v  (layout-dependent): about spatial relationships in multi-panel layouts.
 
 Rules:
-1. Each answer must be grounded in the chunk content.
-2. gold_chunk_ids must be an empty list []; the caller will fill in the real chunk IDs.
+1. Each answer must be grounded in the page content.
+2. gold_page_ids must be an empty list []; the caller will fill in the real page IDs.
 3. Return ONLY a JSON array — no markdown fences, no extra keys.
 
 JSON schema for each element:
@@ -1643,26 +1643,25 @@ JSON schema for each element:
     "answer": "string",
     "question_type": "type_i | type_ii | type_iii | type_iv | type_v",
     "evidence_modality": "text_only | visual | table | chart | layout",
-    "gold_chunk_ids": []
+    "gold_page_ids": []
   }}
 ]
 """
 
 
-def get_slideqa_pairs_for_chunk(
-    chunk_text: str,
-    chunk_id: str,
+def get_slideqa_pairs_for_page(
+    page_text: str,
     page_id: int,
     variant: str,
 ) -> List[Dict[str, Any]]:
-    """Generate SlideQA pairs (types i–v) for one chunk of slide content.
+    """Generate SlideQA pairs (types i–v) for one whole slide page.
 
     Each returned dict has:
         question_text, answer, question_type, evidence_modality,
-        gold_chunk_ids, chunk_id, page_id, variant
+        gold_page_ids, page_id, variant
 
-    gold_chunk_ids is seeded with [chunk_id] so downstream evaluation has
-    a ready-made gold target; the caller may enrich it further.
+    gold_page_ids is seeded with [page_id] so downstream evaluation has
+    a ready-made gold retrieval target.
 
     Returns [] when:
     - OPENAI_API_KEY is not available
@@ -1671,11 +1670,11 @@ def get_slideqa_pairs_for_chunk(
     """
     api_key = get_openai_api_key()
     if not api_key:
-        logger.info("OPENAI_API_KEY not set; skipping SlideQA generation for chunk %s.", chunk_id)
+        logger.info("OPENAI_API_KEY not set; skipping SlideQA generation for page %s.", page_id)
         return []
 
     client = OpenAI(api_key=api_key)
-    prompt = _SLIDEQA_PROMPT_TEMPLATE.format(variant=variant, chunk_text=chunk_text)
+    prompt = _SLIDEQA_PROMPT_TEMPLATE.format(variant=variant, page_text=page_text)
 
     try:
         response = client.chat.completions.create(
@@ -1686,13 +1685,13 @@ def get_slideqa_pairs_for_chunk(
         raw = (response.choices[0].message.content or "").strip()
         pairs = json.loads(raw)
         if not isinstance(pairs, list):
-            logger.warning("SlideQA response was not a JSON array for chunk %s.", chunk_id)
+            logger.warning("SlideQA response was not a JSON array for page %s.", page_id)
             return []
     except json.JSONDecodeError as exc:
-        logger.warning("SlideQA malformed JSON for chunk %s: %s", chunk_id, exc)
+        logger.warning("SlideQA malformed JSON for page %s: %s", page_id, exc)
         return []
     except Exception as exc:
-        logger.warning("SlideQA API call failed for chunk %s: %s", chunk_id, exc)
+        logger.warning("SlideQA API call failed for page %s: %s", page_id, exc)
         return []
 
     enriched: List[Dict[str, Any]] = []
@@ -1705,8 +1704,7 @@ def get_slideqa_pairs_for_chunk(
         if pair.get("question_type") not in _SLIDEQA_VALID_QUESTION_TYPES:
             logger.warning("SlideQA pair has invalid question_type %r, dropping.", pair.get("question_type"))
             continue
-        pair["gold_chunk_ids"] = [chunk_id]
-        pair["chunk_id"] = chunk_id
+        pair["gold_page_ids"] = [page_id]
         pair["page_id"] = page_id
         pair["variant"] = variant
         enriched.append(pair)

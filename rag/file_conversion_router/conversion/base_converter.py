@@ -176,53 +176,92 @@ class BaseConverter(ABC):
         logger.info("✅ Successfully converted page content to chunks.")
         return chunks, metadata
 
-    def generate_slideqa_for_chunks(
+    def generate_slideqa_for_lecture(
         self,
-        chunks: List[Chunk],
         variant_md_path: Path,
         variant: str,
+        content_list_path: Path,
     ) -> None:
-        """Generate SlideQA pairs (types i–v) per chunk and write a .qa.jsonl sidecar.
+        """Generate SlideQA pairs per real slide page and write a .qa.jsonl sidecar.
 
-        Must be called explicitly by the caller (e.g. pipeline script) after
-        converting each variant markdown, passing the variant markdown path and
-        variant label directly — not inferred from input_path.
+        Splits the lecture by physical slide page using MinerU's content_list.json
+        (each item has a ``page_idx`` field).  Calls GPT-4o once per unique page_idx
+        so every QA pair carries the correct ``page_id`` / ``gold_page_ids``.
 
         Args:
-            chunks:          Chunks produced by page.to_chunk() for this variant.
-            variant_md_path: Path to the variant markdown (e.g. lecture01.v2.md).
-                             The sidecar is written as lecture01.v2.qa.jsonl.
-            variant:         One of "v1", "v2", "v3".
+            variant_md_path:   Path to the whole-lecture variant markdown
+                               (e.g. lecture01.v2.md). The sidecar is written as
+                               lecture01.v2.qa.jsonl next to it.
+            variant:           One of "v1", "v2", "v3".
+            content_list_path: Path to the MinerU ``*_content_list.json`` file that
+                               corresponds to this lecture.  Each JSON item must have
+                               at minimum a ``page_idx`` (int) and ``text`` (str) field.
 
-        Output: <variant_md_path stem>.qa.jsonl next to variant_md_path.
-        Idempotent: skips if sidecar already exists.
+        Output: <variant_md_path>.qa.jsonl — one JSON object per line, all pages combined.
+        Idempotent: skips if the sidecar already exists.
         """
         import json as _json
 
-        out_path = variant_md_path.with_suffix(".qa.jsonl")
+        out_path = Path(str(variant_md_path).replace(".md", ".qa.jsonl"))
         if out_path.exists():
             logger.info("SlideQA sidecar already exists, skipping: %s", out_path)
             return
 
-        all_pairs: List[dict] = []
-        for chunk in chunks:
-            chunk_id = str(chunk.chunk_uuid or "unknown")
-            # chunk.index == page_idx from MinerU (0-based page number of the slide)
-            page_id = int(chunk.index) if chunk.index is not None else 0
-            pairs = get_slideqa_pairs_for_chunk(
-                chunk_text=chunk.content,
-                chunk_id=chunk_id,
-                page_id=page_id,
+        # --- 1. Load content_list.json and group text by page_idx ---
+        if not content_list_path.exists():
+            logger.warning(
+                "content_list.json not found at %s; cannot split by page. "
+                "Skipping SlideQA generation for %s.",
+                content_list_path,
+                variant_md_path.name,
+            )
+            return
+
+        with content_list_path.open("r", encoding="utf-8") as fh:
+            content_list = _json.load(fh)
+
+        # Build an ordered mapping: page_idx -> list of text snippets
+        pages: dict[int, list[str]] = {}
+        for item in content_list:
+            page_idx = item.get("page_idx")
+            text = item.get("text", "").strip()
+            if page_idx is None or not text:
+                continue
+            pages.setdefault(page_idx, []).append(text)
+
+        if not pages:
+            logger.warning(
+                "No usable page content found in %s; skipping.", content_list_path
+            )
+            return
+
+        # --- 2. For each page, generate QA pairs using the real page_idx ---
+        all_pairs: list[dict] = []
+        for page_idx in sorted(pages.keys()):
+            page_text = "\n\n".join(pages[page_idx])
+            pairs = get_slideqa_pairs_for_page(
+                page_text=page_text,
+                page_id=page_idx,
                 variant=variant,
             )
             all_pairs.extend(pairs)
+            logger.info(
+                "  page_idx=%d → %d QA pairs (%s)", page_idx, len(pairs), variant
+            )
 
         if not all_pairs:
+            logger.info("No SlideQA pairs generated for %s.", variant_md_path.name)
             return
 
+        # --- 3. Write combined sidecar ---
         lines = [_json.dumps(p, ensure_ascii=False) for p in all_pairs]
         out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        logger.info("Wrote %d SlideQA pairs to %s", len(all_pairs), out_path)
+        logger.info(
+            "Wrote %d SlideQA pairs (%d pages) to %s",
+            len(all_pairs),
+            len(pages),
+            out_path,
+        )
 
     def _to_page(self, input_path: Path, output_path: Path) -> Tuple[Page, dict]:
         """Convert the input file to a Page object and return it along with metadata."""
