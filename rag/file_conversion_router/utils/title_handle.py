@@ -304,6 +304,12 @@ class SchemaFactory:
                 "additionalProperties": False
             }
         }
+    def _create_file_description_schema(self) -> Dict[str, Any]:
+        """Create schema for file description field, shared across all content schemas."""
+        return {
+            "type": "string",
+            "description": "A short summary describing the file type and its PRIMARY teaching topics — exclude prerequisites or tangentially-mentioned concepts (e.g., 'A lecture recording primarily about recursion, covering base cases and tree structures')"
+        }
 
     def create_ipynb_schema(self, title_list: List[str]) -> Dict[str, Any]:
         """Create schema for ipynb content processing."""
@@ -315,10 +321,7 @@ class SchemaFactory:
                 "schema": {
                     "type": "object",
                     "properties": {
-                        "file_description": {
-                            "type": "string",
-                            "description": "A short summary describing the file type and key content (e.g., 'A lecture recording for recursion, it mentioned base cases and tree structures')"
-                        },
+                        "file_description": self._create_file_description_schema(),
                         "key_concepts": self._create_key_concepts_schema(title_list),
                         "problems": self._create_problems_schema(),
                         "recap_questions": self._create_recap_question_schema()
@@ -422,10 +425,7 @@ class SchemaFactory:
     ) -> Dict[str, Any]:
         """Create schema for content without titles."""
         schema_properties = {
-            "file_description": {
-                "type": "string",
-                "description": "A short summary describing the file type and key content (e.g., 'A lecture recording for recursion, it mentioned base cases and tree structures')"
-            },
+            "file_description": self._create_file_description_schema(),
             "paragraphs": self._create_paragraphs_schema(paragraph_count),
             "key_concepts": self._create_generic_key_concepts_schema(),
             "recap_questions": self._create_recap_question_schema(),
@@ -528,10 +528,7 @@ class SchemaFactory:
                 "schema": {
                     "type": "object",
                     "properties": {
-                        "file_description": {
-                            "type": "string",
-                            "description": "A short summary describing the file type and key content (e.g., 'A lecture recording for recursion, it mentioned base cases and tree structures')"
-                        },
+                        "file_description": self._create_file_description_schema(),
                         "titles_with_levels": {
                             "type": "array",
                             "description": "Titles with their hierarchical levels",
@@ -1101,6 +1098,13 @@ class TranscriptManager:
 class PromptBuilder:
     """Builds prompts for OpenAI API calls."""
 
+    FILE_DESCRIPTION_PROMPT = (
+        'Provide a 1-2 sentence summary describing what type of file this is and what its PRIMARY teaching topics are.\n'
+        '            Focus ONLY on the core concepts this file is dedicated to teaching — do NOT include prerequisites, supporting examples, or tangentially-mentioned topics.\n'
+        '            Example: "A lecture recording primarily about recursion, covering base cases, recursive calls, and tree structures."\n'
+        '            Counter-example: Do NOT mention topics like "lists" or "functions" if they are only used as illustrative examples for the main topic.'
+    )
+
     def __init__(self, config: Optional[ProcessingConfig] = None):
         """Initialize prompt builder with configuration."""
         self.config = config or ProcessingConfig()
@@ -1117,8 +1121,7 @@ class PromptBuilder:
             Your task is to perform the following actions and format the output as a single JSON object:
 
             ### Part 0: Generate File Description
-            Provide a 1-2 sentence summary describing what type of file this is and what key topics/concepts it covers.
-            Example: "A lecture recording for recursion, it mentioned base cases, recursive calls, and tree structures."
+            {self.FILE_DESCRIPTION_PROMPT}
 
             ### Part 1: Extract Key Concepts
             Your goal is to create a high-level summary of the entire document by identifying a small, curated set of its most important concepts.
@@ -1174,8 +1177,7 @@ class PromptBuilder:
             You will be given markdown content from a video in the course "{course_name}", from the file "{file_name}".
 
             ### Part 0: Generate File Description
-            Provide a 1-2 sentence summary describing what type of file this is and what key topics/concepts it covers.
-            Example: "A lecture recording for recursion, it mentioned base cases, recursive calls, and tree structures."
+            {self.FILE_DESCRIPTION_PROMPT}
 
             ### Part 1: Structure the Content
             1. **Group into Sections:** Divide the text into 3-{self.config.max_sections} logical sections.
@@ -1212,8 +1214,7 @@ class PromptBuilder:
             You will be given markdown content from a video in the course "{course_name}", from the file "{file_name}".
 
             ### Part 0: Generate File Description
-            Provide a 1-2 sentence summary describing what type of file this is and what key topics/concepts it covers.
-            Example: "A lecture recording for recursion, it mentioned base cases, recursive calls, and tree structures."
+            {self.FILE_DESCRIPTION_PROMPT}
 
             ### Part 1: Structure the Content
             **Generate Titles:** Create one concise, descriptive title for each paragraph.
@@ -1247,8 +1248,7 @@ class PromptBuilder:
             You will be given markdown content from the file "{file_name}" for the course "{course_name}".
 
             ### Part 0: Generate File Description
-            Provide a 1-2 sentence summary describing what type of file this is and what key topics/concepts it covers.
-            Example: "A lecture recording for recursion, it mentioned base cases, recursive calls, and tree structures."
+            {self.FILE_DESCRIPTION_PROMPT}
 
             ### Part 1: Adjust Title Hierarchy Levels
             Given the title list, determine correct semantic hierarchy levels based on logical relationships.
@@ -1280,9 +1280,8 @@ class PromptBuilder:
             Your goal is to create a high-level summary by identifying the most important concepts.
 
             ### Generate File Description
-            Provide a 1-2 sentence summary describing what type of file this is and what key topics/concepts it covers.
-            Example: "A lecture recording for recursion, it mentioned base cases, recursive calls, and tree structures."
-
+            {self.FILE_DESCRIPTION_PROMPT}
+            
             CRITICAL CONSTRAINTS:
             1. **Strict One-to-One Mapping:** Each Source Section maps to exactly ONE Key Concept
             2. **Limited Quantity:** Maximum {self.config.max_key_concepts} concepts
