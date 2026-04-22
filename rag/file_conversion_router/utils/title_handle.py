@@ -1677,7 +1677,7 @@ def get_slideqa_pairs_for_page(
 
     try:
         response = client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
             max_tokens=2000,
         )
