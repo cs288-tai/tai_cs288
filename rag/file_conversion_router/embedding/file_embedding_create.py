@@ -35,6 +35,56 @@ def read_markdown_file(file_path: Path) -> str:
         return ""
 
 
+def _resolve_markdown_path(data_dir: Path, relative_path: str) -> Optional[Path]:
+    """Resolve markdown path from a file record's relative path.
+
+    Supports MinerU output patterns like:
+    - output_dir/subdir/file.pdf/auto/file.pdf.md
+    - output_dir/subdir/file.pdf/pipeline/file.pdf.md
+    - output_dir/subdir/file/file.md
+    - output_dir/subdir/file.md
+    """
+    original_path = Path(relative_path)
+
+    # relative_path is typically "base_dir/subdir/file.ext" while data_dir
+    # already points to ".../base_dir".
+    path_parts = list(original_path.parts)
+    if len(path_parts) > 1:
+        working_path = Path(*path_parts[1:])
+    else:
+        working_path = original_path
+
+    file_name = working_path.name
+    file_stem = working_path.stem
+    parent = working_path.parent
+    markdown_file_name = f"{file_name}.md"
+
+    candidate_paths = [
+        # Current MinerU layout (method folder under file-name folder)
+        data_dir / parent / file_name / "auto" / markdown_file_name,
+        data_dir / parent / file_name / "pipeline" / markdown_file_name,
+        data_dir / parent / file_name / "ocr" / markdown_file_name,
+        data_dir / parent / file_name / "txt" / markdown_file_name,
+        # Legacy/alternate layouts
+        data_dir / parent / file_stem / f"{file_stem}.md",
+        data_dir / parent / f"{file_stem}.md",
+        data_dir / parent / working_path.with_suffix(".md").name,
+    ]
+
+    for candidate in candidate_paths:
+        if candidate.exists():
+            return candidate
+
+    # Dynamic fallback for method-specific folders (e.g. custom MinerU methods).
+    method_root = data_dir / parent / file_name
+    if method_root.exists() and method_root.is_dir():
+        exact_matches = list(method_root.glob(f"*/{markdown_file_name}"))
+        if exact_matches:
+            return exact_matches[0]
+
+    return None
+
+
 def embed_files_from_markdown(
     db_path: str,
     data_dir: str,
@@ -141,52 +191,21 @@ def embed_files_from_markdown(
             relative_path = file_record["relative_path"]
             course_name = file_record["course_name"] or ""
             course_code = file_record["course_code"] or ""
-            
-            # Construct markdown file path
-            # MinerU creates: input_dir/subdir/file.ext -> output_dir/subdir/file/file.ext.md
-            # Note: relative_path is stored relative to parent of input_dir, so first component needs stripping
-            original_path = Path(relative_path)
 
-            # Strip first path component (the base directory name)
-            # relative_path is always "base_dir/subdir/file.ext" but output_dir already includes base_dir
-            path_parts = list(original_path.parts)
-            if len(path_parts) > 1:
-                working_path = Path(*path_parts[1:])
-            else:
-                working_path = original_path
-
-            markdown_file_name = working_path.name + ".md"
-            markdown_relative_path = working_path.parent / working_path.stem / markdown_file_name
-            markdown_full_path = data_dir / markdown_relative_path
-            
-            # Try alternative markdown paths if the direct one doesn't exist
-            if not markdown_full_path.exists():
-                # Try looking in a markdown output directory structure
-                # Common patterns: file.ext -> file/file.md or file.ext -> file.md
-                alt_paths = [
-                    data_dir / original_path.parent / original_path.stem / f"{original_path.stem}.md",
-                    data_dir / f"{original_path.stem}.md",
-                    data_dir / relative_path.replace(original_path.suffix, ".md") if original_path.suffix else None
-                ]
-                
-                found_path = None
-                for alt_path in alt_paths:
-                    if alt_path and alt_path.exists():
-                        found_path = alt_path
-                        break
-                
-                if found_path:
-                    markdown_full_path = found_path
-                else:
-                    print(f"Markdown file not found for {file_name}. Tried: {markdown_full_path}")
-                    error_files += 1
-                    results.append({
-                        "uuid": uuid,
-                        "file_name": file_name,
-                        "status": "error",
-                        "error": "Markdown file not found"
-                    })
-                    continue
+            markdown_full_path = _resolve_markdown_path(data_dir, relative_path)
+            if markdown_full_path is None:
+                print(
+                    f"Markdown file not found for {file_name}. "
+                    f"Searched under: {data_dir / Path(relative_path).parent}"
+                )
+                error_files += 1
+                results.append({
+                    "uuid": uuid,
+                    "file_name": file_name,
+                    "status": "error",
+                    "error": "Markdown file not found"
+                })
+                continue
             
             # Read markdown content
             markdown_content = read_markdown_file(markdown_full_path)
