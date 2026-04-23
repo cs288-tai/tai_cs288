@@ -4,13 +4,19 @@ from file_conversion_router.conversion.base_converter import BaseConverter
 from file_conversion_router.services.tai_MinerU_service.api import (
     convert_pdf_to_md_by_MinerU,
 )
+from file_conversion_router.utils.title_handle import normalize_title_for_match
 
+from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any, Optional
 import base64
 import json
 import os
 import re
+
+# Same heading pattern used by apply_structure_for_one_title, so extraction
+# and matching agree on what counts as a heading.
+_HEADING_PATTERN = re.compile(r"^(?P<hashes>#{1,6})\s+(?P<title>\S.*?)$")
 
 from loguru import logger
 
@@ -51,9 +57,7 @@ class PdfConverter(BaseConverter):
         file_uuid: Optional[str] = None,
     ) -> None:
         """Initialize converter with course metadata."""
-        self.course_name = course_name
-        self.course_code = course_code
-        self.file_uuid = file_uuid
+        super().__init__(course_name, course_code, file_uuid)
 
     def remove_image_links(self, text: str) -> str:
         """Remove all markdown image links from text."""
@@ -147,7 +151,8 @@ class PdfConverter(BaseConverter):
 
         try:
             response = client.chat.completions.create(
-                model="gpt-4o",
+                # Other Models: gpt-5.4-mini-2026-03-17, gpt-5-mini-2025-08-07, gpt-5-nano-2025-08-07
+                model="gpt-5.4-nano-2026-03-17",
                 messages=[
                     {
                         "role": "user",
@@ -393,11 +398,8 @@ class PdfConverter(BaseConverter):
         if not source_path.exists():
             raise FileNotFoundError(f"PDF file not found: {source_path}")
 
-        result = convert_pdf_to_md_by_MinerU(
-            source_path,
-            self.course_name,
-            self.course_code,
-        )
+        output_dir = Path(output_path).parent
+        result = convert_pdf_to_md_by_MinerU(source_path, output_dir)
         md_file_path = self._resolve_markdown_path(result, source_path)
 
         if not md_file_path.exists():
@@ -407,9 +409,21 @@ class PdfConverter(BaseConverter):
         self.replace_images_with_vlm_descriptions(md_file_path)
 
         # 2. Clean while preserving image links and VLM blocks.
-        self.clean_markdown_content(md_file_path)
+        cleaned_content = self.clean_markdown_content(md_file_path)
 
-        # 3. Materialize ablation-ready markdown files (v1/v2/v3).
+        # 3. Populate index_helper from MinerU's content_list.json. Without
+        #    this, BaseConverter.apply_markdown_structure crashes iterating a
+        #    None index_helper, silently fails all retries, and the file is
+        #    skipped before ever being written to the database.
+        content_list = self._load_content_list_json(md_file_path)
+        if content_list is not None:
+            self.generate_index_helper(content_list, md=cleaned_content)
+        else:
+            self.index_helper = []
+
+        # 4. Materialize ablation-ready markdown files (v1/v2/v3).
+        # self._materialize_variant_markdowns(md_file_path) # change from yikang
+
         variant_paths = self._materialize_variant_markdowns(md_file_path)
 
         # 4. Generate SlideQA pairs per slide page for each variant.
@@ -423,33 +437,51 @@ class PdfConverter(BaseConverter):
         return md_file_path
 
     def generate_index_helper(self, data, md=None):
+        """Build index_helper from the post-processed markdown.
+
+        Headings are drawn from the final markdown (what the downstream matcher
+        actually sees), then attributed back to a 1-based page index via
+        MinerU's content_list. Any item with a text_level is treated as a
+        candidate — not just text_level == 1 — so level-2+ slide headings are
+        no longer dropped. Duplicate headings are attributed in document order.
+        """
         self.index_helper = []
-        for item in data:
-            if item.get('text_level') == 1:
-                title = item['text'].strip()
-                if title.startswith('# '):
-                    title = title[2:]
+        if not md:
+            return
 
-                skip_patterns = [
-                    re.compile(r'^\s*ROAR ACADEMY EXERCISES\s*$', re.I),
-                    re.compile(r'^\s*(?:#+\s*)+$')  # lines that are only # + spaces
-                ]
-                if any(p.match(title) for p in skip_patterns):
-                    continue
+        skip_patterns = [
+            re.compile(r'^\s*ROAR ACADEMY EXERCISES\s*$', re.I),
+            re.compile(r'^\s*(?:#+\s*)+$'),  # lines that are only # + spaces
+        ]
 
-                # Check if title appears after any number of # symbols
-                if md:
-                    lines = md.split('\n')
-                    title_found = False
-                    for line in lines:
-                        stripped_line = line.strip()
-                        if stripped_line.startswith('#') and title in stripped_line:
-                            # More precise check: extract the heading text
-                            heading_text = re.sub(r'^#+\s*', '', stripped_line).strip()
-                            if heading_text == title:
-                                title_found = True
-                                break
+        # Build an ordered queue of page indices per normalized title from MinerU's
+        # content_list, covering all title-like items (any text_level).
+        title_to_pages: dict[str, deque] = defaultdict(deque)
+        for item in data or []:
+            if item.get('text_level') is None:
+                continue
+            text = (item.get('text') or '').strip()
+            text = re.sub(r'^#+\s*', '', text).strip()
+            if not text:
+                continue
+            key = normalize_title_for_match(text)
+            page_idx = item.get('page_idx')
+            if key and page_idx is not None:
+                title_to_pages[key].append(page_idx + 1)  # 1-based
 
-                    if title_found:
-                        page_index = item['page_idx'] + 1  # 1-based
-                        self.index_helper.append({title: page_index})
+        last_page = 1
+        for line in md.split('\n'):
+            match = _HEADING_PATTERN.match(line.strip())
+            if not match:
+                continue
+            title = match.group('title').strip()
+            if any(p.match(title) for p in skip_patterns):
+                continue
+            key = normalize_title_for_match(title)
+            queue = title_to_pages.get(key)
+            if queue:
+                page_index = queue.popleft()
+            else:
+                page_index = last_page
+            last_page = page_index
+            self.index_helper.append({title: page_index})

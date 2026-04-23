@@ -3,8 +3,14 @@ import re
 import nbformat
 from nbconvert import MarkdownExporter
 from file_conversion_router.conversion.base_converter import BaseConverter
+from file_conversion_router.utils.title_handle import normalize_title_for_match
 from nbformat.validator import normalize
 import uuid
+
+# Same heading pattern used by apply_structure_for_one_title, so extraction
+# and matching agree on what counts as a heading.
+_HEADING_PATTERN = re.compile(r"^(?P<hashes>#{1,6})\s+(?P<title>\S.*?)$")
+
 
 class NotebookConverter(BaseConverter):
     def __init__(self, course_name, course_code, file_uuid: str = None):
@@ -33,12 +39,35 @@ class NotebookConverter(BaseConverter):
         return titles
 
 
-    def generate_index_helper(self, notebook_content, markdown_content):
-        self.index_helper = []
+    def generate_index_helper_from_markdown(self, final_md: str, notebook_content) -> None:
+        """Build index_helper from the post-processed markdown.
+
+        Titles are drawn from the final markdown (what the downstream matcher
+        sees), then attributed back to a notebook cell index by normalized
+        lookup against each cell's own titles. Titles without a cell match
+        inherit the most recent matched cell index.
+        """
+        # Build normalized-title -> cell_index map from notebook cells
+        cell_lookup = {}
         for i, cell in enumerate(notebook_content.cells):
-            titles = self.extract_all_markdown_titles(cell.source)
-            for title in titles:
-                self.index_helper.append({title: i + 1})
+            for title in self.extract_all_markdown_titles(cell.source):
+                key = normalize_title_for_match(title)
+                if key and key not in cell_lookup:
+                    cell_lookup[key] = i + 1
+
+        self.index_helper = []
+        last_cell_index = 1
+        for line in final_md.split("\n"):
+            match = _HEADING_PATTERN.match(line.strip())
+            if not match:
+                continue
+            title = match.group("title").strip().replace("*", "")
+            if not title:
+                continue
+            key = normalize_title_for_match(title)
+            cell_index = cell_lookup.get(key, last_cell_index)
+            last_cell_index = cell_index
+            self.index_helper.append({title: cell_index})
 
     # Override
     def _to_markdown(self, input_path: Path, output_path: Path) -> Path:
@@ -55,8 +84,9 @@ class NotebookConverter(BaseConverter):
             (markdown_content, resources) = markdown_converter.from_notebook_node(
                 content
             )
-            self.generate_index_helper(content,markdown_content)
-            output_file.write(self._post_process_markdown(markdown_content))
+            final_md = self._post_process_markdown(markdown_content)
+            self.generate_index_helper_from_markdown(final_md, content)
+            output_file.write(final_md)
         return output_path
 
     def _post_process_markdown(self, markdown_content: str) -> str:

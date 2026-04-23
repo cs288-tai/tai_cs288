@@ -10,7 +10,14 @@
       "Bash(bash:*)",
       "Bash(pip show:*)",
       "Bash(pip uninstall:*)",
-      "Bash(pip install:*)"
+      "Bash(pip install:*)",
+      "Bash(/home/bot/anaconda3/envs/yk_env2/bin/python *)",
+      "Bash(poetry run *)",
+      "Bash(kill %1)",
+      "Bash(pkill -f \"file_conversion_router.api\")",
+      "Bash(grep -E \"\\\\.md$|content_list\\\\.json$\")",
+      "Bash(mkdir -p /tmp/tai_cs288_run)",
+      "Bash(python -u -m file_conversion_router.api)"
     ],
     "deny": [],
     "ask": []

@@ -49,6 +49,23 @@ def get_openai_api_key() -> Optional[str]:
 
     return None
 
+def normalize_title_for_match(title: str) -> str:
+    """Normalize a title for loose matching (whitespace, quotes, punctuation, case).
+
+    Shared by title extraction (notebook_converter) and title matching
+    (ContentProcessor.apply_structure_for_one_title) so both sides agree on
+    what counts as "the same title".
+    """
+    t = title.strip().lower()
+    t = t.replace("‘", "'").replace("’", "'")
+    t = t.replace("“", '"').replace("”", '"')
+    t = t.replace('"', "'")
+    t = re.sub(r"\s+", " ", t)
+    t = t.rstrip(":.;,!?-–— ")
+    t = t.replace("'", "").replace('"', "")
+    return t
+
+
 class SpeakerRole(Enum):
     """Enum for standardized speaker roles."""
     PROFESSOR = "Professor"
@@ -710,6 +727,10 @@ class ContentProcessor:
 
         return "".join(md_parts)
 
+    @staticmethod
+    def _normalize_title(title: str) -> str:
+        return normalize_title_for_match(title)
+
     def apply_structure_for_one_title(
         self,
         md_content: str,
@@ -718,6 +739,13 @@ class ContentProcessor:
         """Apply structure to content with one title level."""
         mapping_list = content_dict.get("titles_with_levels", [])
         mapping_list = self.fix_title_levels(mapping_list)
+
+        # Build normalized lookup: normalized_title -> level
+        normalized_lookup = {
+            self._normalize_title(d["title"]): d["level_of_title"]
+            for d in mapping_list
+            if d.get("title")
+        }
 
         i = 0
         lines = md_content.split("\n")
@@ -728,19 +756,17 @@ class ContentProcessor:
             match = title_pattern.match(line.strip())
             if match and i < len(mapping_list):
                 raw_title = match.group("title").strip()
-                # Check if title is in mapping list
-                title_variations = [
-                    raw_title.replace('"', "'"),
-                    raw_title
-                ]
+                normalized = self._normalize_title(raw_title)
 
-                if any(v in [d['title'] for d in mapping_list] for v in title_variations):
-                    new_level = mapping_list[i]["level_of_title"]
+                if normalized in normalized_lookup:
+                    new_level = normalized_lookup[normalized]
                     new_lines.append(f"{'#' * new_level} {raw_title}")
                     i += 1
                 else:
-                    logger.warning(f"Title '{raw_title}' not found in mapping list, skipping")
-                    continue
+                    logger.warning(
+                        f"Title '{raw_title}' not found in mapping list, keeping original heading"
+                    )
+                    new_lines.append(line)
             else:
                 new_lines.append(line)
 

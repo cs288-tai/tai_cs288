@@ -63,9 +63,10 @@ class VideoScraper(BaseScraper):
             "quiet": True,
             "no_warnings": True,
             # "cookiefile": "/home/bot/bot/yk/YK_final/www.youtube.com_cookies.txt",
-            "cookiesfrombrowser": ('chrome', ),
+            "cookiesfrombrowser": ('chrome',),
             "outtmpl": outtmpl,
             "ignoreerrors": True,
+            "format": "bv*+ba/b/best",
 
             # Network retry settings for HTTP 500 and connection errors
             "retries": 10,
@@ -89,27 +90,33 @@ class VideoScraper(BaseScraper):
             return
         if video_info.get('_type') == 'playlist':
             playlist_url = video_info.get('webpage_url')
-            for entry in video_info['entries']:
-                video_url = entry.get('original_url', entry.get('url'))
-                playlist_index = entry.get('playlist_index')
-                filepath = f"{entry['requested_downloads'][0]['filepath']}"
-
-                # Construct video-in-playlist URL
-                video_in_playlist_url = None
-                if playlist_url and playlist_index:
-                    # Extract playlist ID from playlist_url
-                    parsed_playlist = urlparse(playlist_url)
-                    playlist_params = parse_qs(parsed_playlist.query)
-
-                # Save metadata with all URLs
+            entries = video_info.get('entries') or []
+            for entry in entries:
+                if not entry:
+                    continue
+                requested = entry.get('requested_downloads')
+                if not requested:
+                    continue
+                first = requested[0] or {}
+                filepath = first.get('filepath')
+                if not filepath:
+                    continue
+                video_url = entry.get('original_url') or entry.get('url')
                 additional_metadata = {
                     'playlist_url': playlist_url,
                 }
                 self._save_metadata(filepath, video_url, additional_metadata)
         else:
             # For single video
-            video_url = video_info.get('original_url', video_info.get('url'))
-            filepath = f"{video_info['requested_downloads'][0]['filepath']}"
+            video_url = video_info.get('original_url') or video_info.get('url')
+            requested = video_info.get('requested_downloads') or []
+            if not requested:
+                print(f"Skipping {url}, no download produced.")
+                return
+            filepath = (requested[0] or {}).get('filepath')
+            if not filepath:
+                print(f"Skipping {url}, no filepath in download info.")
+                return
             self._save_metadata(filepath, video_url)
 
 
