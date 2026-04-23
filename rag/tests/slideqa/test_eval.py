@@ -15,8 +15,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Optional
-from unittest.mock import MagicMock
-
 import pytest
 
 # ---------------------------------------------------------------------------
@@ -24,7 +22,6 @@ import pytest
 # ---------------------------------------------------------------------------
 
 from rag.slideqa.eval import (
-    citation_correctness,
     hits_at_k,
     mrr,
     recall_at_k,
@@ -55,21 +52,6 @@ def _page(page_number: int, rank: int = 1) -> _FakePage:
         score=1.0 / rank,
         rank=rank,
     )
-
-
-# ---------------------------------------------------------------------------
-# Minimal stub for a QA response object (used by citation_correctness)
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class _FakeCitation:
-    page_number: int   # 1-based
-
-
-@dataclass(frozen=True)
-class _FakeQAResponse:
-    citations: list[_FakeCitation]
 
 
 # ---------------------------------------------------------------------------
@@ -268,81 +250,7 @@ class TestMRR:
 
 
 # ---------------------------------------------------------------------------
-# D. citation_correctness tests
-# ---------------------------------------------------------------------------
-
-
-class TestCitationCorrectness:
-    """citation_correctness(questions, qa_responses) -> float
-
-    For each (question, response) pair:
-      hit if ANY citation.page_number - 1 is in question["gold_page_ids"].
-    Returns fraction of pairs that hit.
-
-    questions: list of dicts with "gold_page_ids" key.
-    qa_responses: list of response objects with a .citations attribute,
-                  each citation having .page_number (1-based).
-    """
-
-    def test_all_citations_correct(self):
-        # gold=[0] → page_number=1 is correct. Citation page_number=1 → hit.
-        questions = [{"gold_page_ids": [0]}, {"gold_page_ids": [0]}]
-        responses = [
-            _FakeQAResponse(citations=[_FakeCitation(page_number=1)]),
-            _FakeQAResponse(citations=[_FakeCitation(page_number=1)]),
-        ]
-        assert citation_correctness(questions, responses) == pytest.approx(1.0)
-
-    def test_no_citations_correct(self):
-        # gold=[0] → page_number=1. Citation has page_number=5 → miss.
-        questions = [{"gold_page_ids": [0]}]
-        responses = [_FakeQAResponse(citations=[_FakeCitation(page_number=5)])]
-        assert citation_correctness(questions, responses) == pytest.approx(0.0)
-
-    def test_partial_citation_correctness(self):
-        # 1 hit, 1 miss → 0.5
-        questions = [
-            {"gold_page_ids": [0]},  # page_number=1 → hit
-            {"gold_page_ids": [9]},  # page_number=10; citation gives page_number=1 → miss
-        ]
-        responses = [
-            _FakeQAResponse(citations=[_FakeCitation(page_number=1)]),
-            _FakeQAResponse(citations=[_FakeCitation(page_number=1)]),
-        ]
-        assert citation_correctness(questions, responses) == pytest.approx(0.5)
-
-    def test_empty_citations_is_miss(self):
-        questions = [{"gold_page_ids": [0]}]
-        responses = [_FakeQAResponse(citations=[])]
-        assert citation_correctness(questions, responses) == pytest.approx(0.0)
-
-    def test_any_citation_hit_counts(self):
-        # Multiple citations; second one is correct.
-        questions = [{"gold_page_ids": [2]}]  # page_number=3
-        responses = [
-            _FakeQAResponse(citations=[
-                _FakeCitation(page_number=1),  # wrong
-                _FakeCitation(page_number=3),  # correct (3-1=2 in gold)
-            ])
-        ]
-        assert citation_correctness(questions, responses) == pytest.approx(1.0)
-
-    def test_empty_questions_returns_zero(self):
-        assert citation_correctness([], []) == pytest.approx(0.0)
-
-    def test_offset_check_page_idx_0_maps_to_page_number_1(self):
-        # Explicit offset test: gold_page_ids=[0] should only hit page_number=1, not page_number=0.
-        questions = [{"gold_page_ids": [0]}]
-        # Citation with page_number=0 (invalid, but let's verify it does NOT count as hit).
-        responses_wrong = [_FakeQAResponse(citations=[_FakeCitation(page_number=0)])]
-        assert citation_correctness(questions, responses_wrong) == pytest.approx(0.0)
-        # Citation with page_number=1 should hit.
-        responses_correct = [_FakeQAResponse(citations=[_FakeCitation(page_number=1)])]
-        assert citation_correctness(questions, responses_correct) == pytest.approx(1.0)
-
-
-# ---------------------------------------------------------------------------
-# E. contains_answer / contains_answer_rate tests  (RED — added before impl)
+# D. contains_answer / contains_answer_rate tests
 # ---------------------------------------------------------------------------
 
 

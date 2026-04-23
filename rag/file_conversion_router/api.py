@@ -747,11 +747,16 @@ if __name__ == "__main__":
     )
 
     # ===== RECOMMENDED WORKFLOW =====
+    # To use, either:
+    #   1. Pass a real config path to convert_directory(), or
+    #   2. Use process_courses_from_master_config() for batch processing.
+    # Example (uncomment and edit the path):
+    #
+    # convert_directory("configs/CS288_config.yaml", auto_embed=True)
 
-    # Step 1: Convert and embed a single course
-    convert_directory(
-        "/home/bot/bot/yk/YK_final/course_yaml/CS 61A_config.yaml",
-        auto_embed=True
+    logger.info(
+        "file_conversion_router.api imported successfully. "
+        "Call convert_directory(config_path) or process_courses_from_master_config() to start."
     )
 
     # # Step 2: Process all courses marked for update (batch)

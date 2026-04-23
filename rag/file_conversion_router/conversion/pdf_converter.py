@@ -410,7 +410,14 @@ class PdfConverter(BaseConverter):
         self.clean_markdown_content(md_file_path)
 
         # 3. Materialize ablation-ready markdown files (v1/v2/v3).
-        self._materialize_variant_markdowns(md_file_path)
+        variant_paths = self._materialize_variant_markdowns(md_file_path)
+
+        # 4. Generate SlideQA pairs per slide page for each variant.
+        content_list_path = md_file_path.with_name(
+            f"{md_file_path.stem}_content_list.json"
+        )
+        for variant, variant_md_path in variant_paths.items():
+            self.generate_slideqa_for_lecture(variant_md_path, variant, content_list_path)
 
         # Return the master markdown path for BaseConverter to use.
         return md_file_path

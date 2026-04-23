@@ -148,47 +148,7 @@ def mrr(
 
 
 # ---------------------------------------------------------------------------
-# D. citation_correctness — checks that cited pages are gold pages
-# ---------------------------------------------------------------------------
-
-
-def citation_correctness(
-    questions: list[dict[str, Any]],
-    qa_responses: list,
-) -> float:
-    """Compute citation correctness: fraction of responses where at least one
-    cited page is in the gold page set.
-
-    A citation is correct if:
-        (citation.page_number - 1) in question["gold_page_ids"]
-
-    This is a looser metric than recall_at_k because it only checks pages
-    that the QA model chose to cite, not the full retrieval set.
-
-    Args:
-        questions:    List of QA dicts with "gold_page_ids" key (0-based page_idx).
-        qa_responses: List of response objects. Each must have a `.citations`
-                      attribute — an iterable of objects with `.page_number` (1-based).
-                      Must be the same length as questions and in the same order.
-
-    Returns:
-        Float in [0.0, 1.0]. Returns 0.0 for empty input.
-    """
-    if not questions:
-        return 0.0
-
-    hits = 0
-    for q, response in zip(questions, qa_responses):
-        gold_set = set(q["gold_page_ids"])
-        # A hit means at least one citation.page_number - 1 is in gold_set.
-        if any((c.page_number - 1) in gold_set for c in response.citations):
-            hits += 1
-
-    return hits / len(questions)
-
-
-# ---------------------------------------------------------------------------
-# E. contains_answer — answer-level metric (no retrieval needed)
+# D. contains_answer — answer-level metric (no retrieval needed)
 # ---------------------------------------------------------------------------
 
 
