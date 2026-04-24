@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Any, Tuple
 from pathlib import Path
 from textwrap import dedent
 from enum import Enum
+import base64
 import os
 import re
 import json
@@ -1648,9 +1649,9 @@ _SLIDEQA_UNANSWERABLE_MARKERS = (
     "n/a",
 )
 
-_SLIDEQA_PROMPT_TEMPLATE = """\
-You are an expert educator creating answerable question-answer pairs from a \
-single lecture slide page.
+_SLIDEQA_PROMPT_TEMPLATE_TEXT_ONLY = """\
+You are an expert educator creating a question-answer dataset from a single \
+lecture slide page.
 
 Page content (index variant: {variant}):
 ```
@@ -1692,56 +1693,97 @@ JSON schema for each element:
 ]
 """
 
+_SLIDEQA_PROMPT_TEMPLATE_VISION = """\
+You are an expert educator creating a question-answer dataset from a single \
+lecture slide page.
 
-def _normalize_for_match(text: str) -> str:
-    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9\s]", " ", (text or "").lower())).strip()
+You are provided with:
+1. The extracted text from the slide (below).
+2. One or more slide images attached to this message — examine them carefully \
+to answer visual questions accurately.
+
+Page content (index variant: {variant}):
+```
+{page_text}
+```
+
+Generate QA pairs covering ALL five question types listed below. \
+Skip a type only if the page contains absolutely no relevant content for it. \
+For type_ii, type_iii, type_iv, and type_v, base your questions and answers \
+on what you can actually see in the attached images, not just the text.
+
+  - type_i  (text-only): answerable from slide text alone.
+  - type_ii (image-dependent / diagram): requires interpreting a diagram or figure \
+visible in the images.
+  - type_iii (table-centric): requires reading or comparing table values visible \
+in the images.
+  - type_iv (chart/graph): about chart trends, axis values, or legend visible \
+in the images.
+  - type_v  (layout-dependent): about spatial relationships in multi-panel layouts \
+visible in the images.
+
+Rules:
+1. Each answer must be grounded in the page content or the attached images.
+2. gold_page_ids must be an empty list []; the caller will fill in the real page IDs.
+3. Return ONLY a JSON array — no markdown fences, no extra keys.
+
+JSON schema for each element:
+[
+  {{
+    "question_text": "string",
+    "answer": "string",
+    "question_type": "type_i | type_ii | type_iii | type_iv | type_v",
+    "evidence_modality": "text_only | visual | table | chart | layout",
+    "gold_page_ids": []
+  }}
+]
+"""
 
 
-def _token_set(text: str) -> set[str]:
-    return {tok for tok in _normalize_for_match(text).split() if len(tok) >= 3}
 
+def _encode_image_as_data_url(image_path: Path) -> Optional[str]:
+    """Return a base64 data: URI for the image, or None if the file is missing."""
+    try:
+        raw = image_path.read_bytes()
+    except OSError:
+        logger.warning("SlideQA: image file not found, skipping: %s", image_path)
+        return None
 
-def _is_slideqa_pair_grounded(pair: Dict[str, Any], page_text: str) -> bool:
-    question = str(pair.get("question_text", "")).strip()
-    answer = str(pair.get("answer", "")).strip()
-    if not question or not answer:
-        return False
-
-    answer_l = answer.lower()
-    if any(marker in answer_l for marker in _SLIDEQA_UNANSWERABLE_MARKERS):
-        return False
-
-    page_norm = _normalize_for_match(page_text)
-    answer_norm = _normalize_for_match(answer)
-    if not answer_norm:
-        return False
-
-    # Short answers (codes, names, times) should appear directly in page text.
-    if len(answer_norm.split()) <= 3:
-        return answer_norm in page_norm
-
-    # Longer answers should share substantial lexical overlap with page text.
-    answer_tokens = _token_set(answer)
-    if not answer_tokens:
-        return False
-    page_tokens = _token_set(page_text)
-    overlap = len(answer_tokens & page_tokens) / max(len(answer_tokens), 1)
-    return overlap >= 0.6
+    # Infer MIME type from extension; default to png.
+    suffix = image_path.suffix.lower().lstrip(".")
+    mime = {"jpg": "jpeg", "jpeg": "jpeg", "png": "png", "gif": "gif", "webp": "webp"}.get(
+        suffix, "png"
+    )
+    b64 = base64.b64encode(raw).decode("ascii")
+    return f"data:image/{mime};base64,{b64}"
 
 
 def get_slideqa_pairs_for_page(
     page_text: str,
     page_id: int,
     variant: str,
+    image_paths: Optional[List[Path]] = None,
 ) -> List[Dict[str, Any]]:
     """Generate SlideQA pairs (types i–v) for one whole slide page.
+
+    When image_paths is provided and non-empty, the OpenAI call uses a vision
+    model (gpt-4o-mini supports vision) and includes base64-encoded image_url
+    content blocks alongside the text prompt.  Missing image files are silently
+    skipped so a single bad path does not abort the whole page.
+
+    Args:
+        page_text:    Text content of the slide page.
+        page_id:      0-based MinerU page_idx for this page.
+        variant:      One of "v1", "v2", "v3".
+        image_paths:  Optional list of Path objects for images on this page.
+                      When None or [], text-only mode is used (no vision blocks).
 
     Each returned dict has:
         question_text, answer, question_type, evidence_modality,
         gold_page_ids, page_id, variant
 
-    gold_page_ids is seeded with [page_id] so downstream evaluation has
-    a ready-made gold retrieval target.
+    gold_page_ids is seeded with [page_id] (0-based) so downstream evaluation
+    has a ready-made gold retrieval target.
 
     Returns [] when:
     - OPENAI_API_KEY is not available
@@ -1754,13 +1796,37 @@ def get_slideqa_pairs_for_page(
         return []
 
     client = OpenAI(api_key=api_key)
-    prompt = _SLIDEQA_PROMPT_TEMPLATE.format(variant=variant, page_text=page_text)
+
+    # Build message content: text-only or vision (text + image_url blocks).
+    valid_images: List[Path] = []
+    if image_paths:
+        for p in image_paths:
+            if Path(p).exists():
+                valid_images.append(Path(p))
+            else:
+                logger.warning("SlideQA: image file not found, skipping: %s", p)
+
+    if valid_images:
+        # Vision path: use vision-specific prompt that tells the model to use images.
+        prompt = _SLIDEQA_PROMPT_TEMPLATE_VISION.format(variant=variant, page_text=page_text)
+        content_blocks: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
+        for img_path in valid_images:
+            data_url = _encode_image_as_data_url(img_path)
+            if data_url is not None:
+                content_blocks.append(
+                    {"type": "image_url", "image_url": {"url": data_url}}
+                )
+        user_content: Any = content_blocks
+    else:
+        # Text-only path: plain string prompt.
+        prompt = _SLIDEQA_PROMPT_TEMPLATE_TEXT_ONLY.format(variant=variant, page_text=page_text)
+        user_content = prompt
 
     try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=2000,
+            messages=[{"role": "user", "content": user_content}],
+            max_tokens=4096,  # raised from 2000: vision+JSON responses need more headroom
         )
         raw = (response.choices[0].message.content or "").strip()
         pairs = json.loads(raw)

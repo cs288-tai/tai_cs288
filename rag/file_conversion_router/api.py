@@ -755,6 +755,12 @@ if __name__ == "__main__":
     # convert_directory("configs/CS288_config.yaml", auto_embed=True)
 
 
+    # Step 1: Convert and embed a single course
+    # convert_directory(
+    #     "/home/bot/bot/yk/YK_final/course_yaml/CS 61A_config.yaml",
+    #     auto_embed=True
+    # )
+
     logger.info(
         "file_conversion_router.api imported successfully. "
         "Call convert_directory(config_path) or process_courses_from_master_config() to start."

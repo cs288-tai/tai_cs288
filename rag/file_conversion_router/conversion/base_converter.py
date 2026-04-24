@@ -220,14 +220,27 @@ class BaseConverter(ABC):
         with content_list_path.open("r", encoding="utf-8") as fh:
             content_list = _json.load(fh)
 
-        # Build an ordered mapping: page_idx -> list of text snippets
+        # Build ordered mappings: page_idx -> text snippets, page_idx -> image paths
         pages: dict[int, list[str]] = {}
+        page_images: dict[int, list[Path]] = {}
         for item in content_list:
             page_idx = item.get("page_idx")
-            text = item.get("text", "").strip()
-            if page_idx is None or not text:
+            if page_idx is None:
                 continue
-            pages.setdefault(page_idx, []).append(text)
+            item_type = item.get("type", "")
+            if item_type == "image":
+                img_path_raw = item.get("img_path", "")
+                if img_path_raw:
+                    img_path = Path(img_path_raw)
+                    # img_path from MinerU is relative to the output directory
+                    # that contains content_list.json, not to CWD.
+                    if not img_path.is_absolute():
+                        img_path = content_list_path.parent / img_path
+                    page_images.setdefault(page_idx, []).append(img_path)
+            else:
+                text = item.get("text", "").strip()
+                if text:
+                    pages.setdefault(page_idx, []).append(text)
 
         if not pages:
             logger.warning(
@@ -239,14 +252,17 @@ class BaseConverter(ABC):
         all_pairs: list[dict] = []
         for page_idx in sorted(pages.keys()):
             page_text = "\n\n".join(pages[page_idx])
+            image_paths = page_images.get(page_idx, [])
             pairs = get_slideqa_pairs_for_page(
                 page_text=page_text,
                 page_id=page_idx,
                 variant=variant,
+                image_paths=image_paths,
             )
             all_pairs.extend(pairs)
             logger.info(
-                "  page_idx=%d → %d QA pairs (%s)", page_idx, len(pairs), variant
+                "  page_idx=%d → %d QA pairs, %d images (%s)",
+                page_idx, len(pairs), len(image_paths), variant,
             )
 
         if not all_pairs:
