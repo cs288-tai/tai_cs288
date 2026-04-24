@@ -1637,18 +1637,31 @@ _SLIDEQA_VALID_QUESTION_TYPES = frozenset(
 _SLIDEQA_REQUIRED_KEYS = frozenset(
     {"question_text", "answer", "question_type", "evidence_modality"}
 )
+_SLIDEQA_MAX_PAIRS_PER_PAGE = 8
+_SLIDEQA_UNANSWERABLE_MARKERS = (
+    "not provided",
+    "not mentioned",
+    "not specified",
+    "cannot be determined",
+    "can't be determined",
+    "unknown",
+    "n/a",
+)
 
 _SLIDEQA_PROMPT_TEMPLATE = """\
-You are an expert educator creating a question-answer dataset from a single \
-lecture slide page.
+You are an expert educator creating answerable question-answer pairs from a \
+single lecture slide page.
 
 Page content (index variant: {variant}):
 ```
 {page_text}
 ```
 
-Generate QA pairs covering ALL five question types listed below. \
-Skip a type only if the page contains absolutely no relevant content for it.
+Generate only HIGH-CONFIDENCE QA pairs that are directly answerable from the \
+page content shown above.
+
+Do NOT force all five question types. If a type has no clear evidence, skip it.
+It is acceptable to return only type_i for text-heavy pages.
 
   - type_i  (text-only): answerable from slide text alone.
   - type_ii (image-dependent / diagram): requires interpreting a diagram or figure.
@@ -1657,7 +1670,13 @@ Skip a type only if the page contains absolutely no relevant content for it.
   - type_v  (layout-dependent): about spatial relationships in multi-panel layouts.
 
 Rules:
-1. Each answer must be grounded in the page content.
+1. Each question must be answerable from explicit evidence in page content.
+2. Answers must be short, specific, and factual.
+3. Do NOT ask vague questions (e.g., "What is this slide about?") unless the exact title is explicitly present.
+4. Do NOT output placeholders, uncertainty, or hedging (e.g., "not mentioned", "unknown", "cannot determine").
+5. Prefer 3-8 high-quality pairs over many low-quality pairs.
+6. Avoid duplicates or near-duplicates.
+7. If there is no reliable question, return [].
 2. gold_page_ids must be an empty list []; the caller will fill in the real page IDs.
 3. Return ONLY a JSON array — no markdown fences, no extra keys.
 
@@ -1672,6 +1691,42 @@ JSON schema for each element:
   }}
 ]
 """
+
+
+def _normalize_for_match(text: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9\s]", " ", (text or "").lower())).strip()
+
+
+def _token_set(text: str) -> set[str]:
+    return {tok for tok in _normalize_for_match(text).split() if len(tok) >= 3}
+
+
+def _is_slideqa_pair_grounded(pair: Dict[str, Any], page_text: str) -> bool:
+    question = str(pair.get("question_text", "")).strip()
+    answer = str(pair.get("answer", "")).strip()
+    if not question or not answer:
+        return False
+
+    answer_l = answer.lower()
+    if any(marker in answer_l for marker in _SLIDEQA_UNANSWERABLE_MARKERS):
+        return False
+
+    page_norm = _normalize_for_match(page_text)
+    answer_norm = _normalize_for_match(answer)
+    if not answer_norm:
+        return False
+
+    # Short answers (codes, names, times) should appear directly in page text.
+    if len(answer_norm.split()) <= 3:
+        return answer_norm in page_norm
+
+    # Longer answers should share substantial lexical overlap with page text.
+    answer_tokens = _token_set(answer)
+    if not answer_tokens:
+        return False
+    page_tokens = _token_set(page_text)
+    overlap = len(answer_tokens & page_tokens) / max(len(answer_tokens), 1)
+    return overlap >= 0.6
 
 
 def get_slideqa_pairs_for_page(
@@ -1720,6 +1775,7 @@ def get_slideqa_pairs_for_page(
         return []
 
     enriched: List[Dict[str, Any]] = []
+    seen_questions: set[str] = set()
     for pair in pairs:
         if not isinstance(pair, dict):
             continue
@@ -1729,10 +1785,23 @@ def get_slideqa_pairs_for_page(
         if pair.get("question_type") not in _SLIDEQA_VALID_QUESTION_TYPES:
             logger.warning("SlideQA pair has invalid question_type %r, dropping.", pair.get("question_type"))
             continue
+
+        q_norm = _normalize_for_match(str(pair.get("question_text", "")))
+        if not q_norm or q_norm in seen_questions:
+            continue
+
+        if not _is_slideqa_pair_grounded(pair, page_text):
+            logger.warning("SlideQA pair appears ungrounded; dropping question: %s", pair.get("question_text"))
+            continue
+
+        seen_questions.add(q_norm)
         pair["gold_page_ids"] = [page_id]
         pair["page_id"] = page_id
         pair["variant"] = variant
         enriched.append(pair)
+
+        if len(enriched) >= _SLIDEQA_MAX_PAIRS_PER_PAGE:
+            break
 
     return enriched
 
