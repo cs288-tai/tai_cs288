@@ -67,11 +67,32 @@ from rag.file_conversion_router.utils.title_handle import get_slideqa_pairs_for_
 
 
 def _find_content_list(lecture_dir: Path, stem: str) -> Path | None:
-    """Return the MinerU content_list.json path for a lecture, or None."""
+    """Return the MinerU content_list.json path for a lecture, or None.
+
+    Tries ``<stem>_content_list.json`` first (matches the folder name), then
+    falls back to any ``*_content_list.json`` in the directory so we also
+    handle layouts where the markdown stems include the source extension
+    (e.g. ``CS288_sp26_01_Intro.pdf_content_list.json``).
+    """
     candidate = lecture_dir / f"{stem}_content_list.json"
     if candidate.exists():
         return candidate
+    matches = sorted(lecture_dir.glob("*_content_list.json"))
+    if matches:
+        return matches[0]
     return None
+
+
+def _discover_stem(lecture_dir: Path, default_stem: str) -> str:
+    """Discover the markdown stem used by the variant files.
+
+    Looks for ``*.v1.md`` and returns the prefix before ``.v1.md``.
+    Falls back to the folder name if no variant file is found yet.
+    """
+    matches = sorted(lecture_dir.glob("*.v1.md"))
+    if matches:
+        return matches[0].name[: -len(".v1.md")]
+    return default_stem
 
 
 def _load_pages(content_list_path: Path) -> dict[int, str]:
@@ -101,11 +122,15 @@ def _generate_for_lecture_variant(
     variant: str,
     course_code: str,
     pages: dict[int, str],
+    force: bool = False,
 ) -> Path | None:
     """Generate QA pairs for one lecture × one variant, write a sidecar .qa.jsonl.
 
     Returns the sidecar path if QA was generated, None if skipped or failed.
-    Skips silently if the sidecar already exists (idempotent).
+    By default skips silently if the sidecar already exists (idempotent).
+    Pass ``force=True`` to overwrite — useful when the QA prompt changes and
+    the sidecars need to be regenerated without re-running the rest of the
+    RAG pipeline.
     """
     variant_md = lecture_dir / f"{stem}.{variant}.md"
     if not variant_md.exists():
@@ -114,9 +139,11 @@ def _generate_for_lecture_variant(
 
     # Sidecar path uses .qa.jsonl (not .md.qa.jsonl).
     sidecar = lecture_dir / f"{stem}.{variant}.qa.jsonl"
-    if sidecar.exists():
-        print(f"    [skip] {sidecar.name} already exists")
+    if sidecar.exists() and not force:
+        print(f"    [skip] {sidecar.name} already exists (use --force to overwrite)")
         return sidecar
+    if sidecar.exists() and force:
+        print(f"    [force] regenerating {sidecar.name}")
 
     all_pairs: list[dict] = []
     for page_idx in sorted(pages.keys()):
@@ -160,6 +187,7 @@ def generate_all(
     processed_dir: Path,
     course_code: str,
     output_benchmark: Path,
+    force: bool = False,
 ) -> None:
     """Walk processed_dir, generate QA for all lectures × variants, merge.
 
@@ -171,16 +199,24 @@ def generate_all(
     variants = ("v1", "v2", "v3")
     all_sidecars: list[Path] = []
 
-    for lecture_dir in sorted(processed_dir.iterdir()):
-        if not lecture_dir.is_dir():
-            continue
-        stem = lecture_dir.name
-        content_list = _find_content_list(lecture_dir, stem)
+    # Discover every lecture by recursively finding *.v1.md anywhere under
+    # processed_dir. The directory containing the v1 file is the work dir
+    # (so layouts like ``<lecture>/<stem>.pdf/auto/<stem>.pdf.v1.md`` from
+    # MinerU are handled the same as flat ``<lecture>/<stem>.v1.md``).
+    v1_files = sorted(processed_dir.rglob("*.v1.md"))
+    if not v1_files:
+        print(f"[warn] no *.v1.md files found anywhere under {processed_dir}")
+        return
+
+    for v1_path in v1_files:
+        work_dir = v1_path.parent
+        stem = v1_path.name[: -len(".v1.md")]
+        content_list = _find_content_list(work_dir, stem)
         if content_list is None:
-            print(f"[skip] {stem}: no content_list.json found")
+            print(f"[skip] {v1_path}: no *_content_list.json next to it")
             continue
 
-        print(f"[lecture] {stem}")
+        print(f"[lecture] {work_dir}  (stem={stem})")
         pages = _load_pages(content_list)
         if not pages:
             print(f"  [warn] {stem}: content_list.json has no usable pages")
@@ -189,7 +225,7 @@ def generate_all(
 
         for variant in variants:
             sidecar = _generate_for_lecture_variant(
-                lecture_dir, stem, variant, course_code, pages
+                work_dir, stem, variant, course_code, pages, force=force
             )
             if sidecar is not None:
                 all_sidecars.append(sidecar)
@@ -222,7 +258,13 @@ def _parse_args() -> argparse.Namespace:
         "--processed-dir",
         required=True,
         type=Path,
-        help="Directory with one subfolder per lecture (each containing *.v1.md, *.v2.md, *.v3.md, *_content_list.json).",
+        help=(
+            "Root directory to scan recursively for *.v1.md files. The "
+            "directory containing each *.v1.md is treated as that lecture's "
+            "work dir (must also contain *.v2.md, *.v3.md, and "
+            "*_content_list.json). Both flat and MinerU's "
+            "<lecture>/<stem>.pdf/auto/ layouts are supported."
+        ),
     )
     parser.add_argument(
         "--course-code",
@@ -234,6 +276,14 @@ def _parse_args() -> argparse.Namespace:
         default="cs288_benchmark.jsonl",
         type=Path,
         help="Path to write the merged benchmark JSONL (default: cs288_benchmark.jsonl).",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Regenerate every <stem>.<variant>.qa.jsonl sidecar even if it "
+            "already exists. Use this after changing the QA-generation prompt."
+        ),
     )
     return parser.parse_args()
 
@@ -248,4 +298,5 @@ if __name__ == "__main__":
         processed_dir=processed,
         course_code=args.course_code,
         output_benchmark=Path(args.output_benchmark),
+        force=args.force,
     )
