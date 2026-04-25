@@ -95,25 +95,52 @@ def _discover_stem(lecture_dir: Path, default_stem: str) -> str:
     return default_stem
 
 
-def _load_pages(content_list_path: Path) -> dict[int, str]:
-    """Load content_list.json and group text snippets by 0-based page_idx.
+def _load_pages(
+    content_list_path: Path,
+) -> tuple[dict[int, str], dict[int, list[Path]]]:
+    """Load content_list.json and group text snippets + image paths by 0-based page_idx.
 
-    Returns a dict: { page_idx (int, 0-based): combined_text (str) }
-    Items with no text or no page_idx are skipped.
+    Returns a tuple of two dicts, both keyed by 0-based ``page_idx``:
+        - ``page_text``:    page_idx -> combined text content (may be "")
+        - ``page_images``:  page_idx -> list of absolute image paths
+
+    Image paths from MinerU's content_list.json are relative to the directory
+    that contains the JSON file, so we resolve them against
+    ``content_list_path.parent`` exactly like
+    ``base_converter.generate_slideqa_for_lecture`` does.
+
+    A page is included in the output even if it has no text but does have
+    images (common for title slides and figure-only slides) so that the
+    vision-prompted model can still produce QA from the image alone.
     """
     with content_list_path.open("r", encoding="utf-8") as fh:
         items = json.load(fh)
 
-    pages: dict[int, list[str]] = {}
+    page_text_parts: dict[int, list[str]] = {}
+    page_images: dict[int, list[Path]] = {}
+
     for item in items:
         page_idx = item.get("page_idx")
-        text = item.get("text", "").strip()
-        if page_idx is None or not text:
+        if page_idx is None:
             continue
-        pages.setdefault(page_idx, []).append(text)
+        item_type = item.get("type", "")
+        if item_type == "image":
+            img_path_raw = item.get("img_path", "")
+            if not img_path_raw:
+                continue
+            img_path = Path(img_path_raw)
+            if not img_path.is_absolute():
+                img_path = content_list_path.parent / img_path
+            page_images.setdefault(page_idx, []).append(img_path)
+        else:
+            text = item.get("text", "").strip()
+            if text:
+                page_text_parts.setdefault(page_idx, []).append(text)
 
-    # Join multiple text snippets on the same page into one block.
-    return {idx: "\n\n".join(parts) for idx, parts in pages.items()}
+    page_text = {
+        idx: "\n\n".join(parts) for idx, parts in page_text_parts.items()
+    }
+    return page_text, page_images
 
 
 def _generate_for_lecture_variant(
@@ -122,6 +149,7 @@ def _generate_for_lecture_variant(
     variant: str,
     course_code: str,
     pages: dict[int, str],
+    page_images: dict[int, list[Path]],
     force: bool = False,
 ) -> Path | None:
     """Generate QA pairs for one lecture × one variant, write a sidecar .qa.jsonl.
@@ -146,12 +174,18 @@ def _generate_for_lecture_variant(
         print(f"    [force] regenerating {sidecar.name}")
 
     all_pairs: list[dict] = []
-    for page_idx in sorted(pages.keys()):
-        page_text = pages[page_idx]
+    # Iterate over every page that has either text or images. A title slide
+    # may be image-only — skipping image-only pages would silently drop QA
+    # whenever the new prompt relies on the vision model.
+    all_page_ids = sorted(set(pages.keys()) | set(page_images.keys()))
+    for page_idx in all_page_ids:
+        page_text = pages.get(page_idx, "")
+        image_paths = page_images.get(page_idx, [])
         pairs = get_slideqa_pairs_for_page(
             page_text=page_text,
             page_id=page_idx,   # 0-based, stored as gold_page_ids
             variant=variant,
+            image_paths=image_paths,
         )
         # Rename question_text → question and answer → answer_short
         # to match the required QA schema.
@@ -217,15 +251,18 @@ def generate_all(
             continue
 
         print(f"[lecture] {work_dir}  (stem={stem})")
-        pages = _load_pages(content_list)
-        if not pages:
+        pages, page_images = _load_pages(content_list)
+        n_pages = len(set(pages.keys()) | set(page_images.keys()))
+        if n_pages == 0:
             print(f"  [warn] {stem}: content_list.json has no usable pages")
             continue
-        print(f"  found {len(pages)} slide pages")
+        n_with_images = sum(1 for v in page_images.values() if v)
+        print(f"  found {n_pages} slide pages ({n_with_images} with images)")
 
         for variant in variants:
             sidecar = _generate_for_lecture_variant(
-                work_dir, stem, variant, course_code, pages, force=force
+                work_dir, stem, variant, course_code, pages, page_images,
+                force=force,
             )
             if sidecar is not None:
                 all_sidecars.append(sidecar)
