@@ -217,6 +217,18 @@ def _generate_for_lecture_variant(
     return sidecar
 
 
+def _default_benchmark_path(processed_dir: Path, course_code: str) -> Path:
+    """Default location for the merged benchmark JSONL.
+
+    Written **inside** ``processed_dir`` (next to the lectures it summarises)
+    so the merged file is easy to find — no separate output path to remember.
+    Filename includes the course code and the processed_dir name to avoid
+    collisions when running for different scopes.
+    """
+    name = f"{course_code.lower()}_{processed_dir.name}_benchmark.jsonl"
+    return processed_dir / name
+
+
 def generate_all(
     processed_dir: Path,
     course_code: str,
@@ -310,9 +322,13 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-benchmark",
-        default="cs288_benchmark.jsonl",
+        default=None,
         type=Path,
-        help="Path to write the merged benchmark JSONL (default: cs288_benchmark.jsonl).",
+        help=(
+            "Path to write the merged benchmark JSONL. "
+            "Default: <processed-dir>/<course-code>_<processed-dir-name>_benchmark.jsonl "
+            "so the merged file lives next to the lectures it covers."
+        ),
     )
     parser.add_argument(
         "--force",
@@ -331,9 +347,14 @@ if __name__ == "__main__":
     if not processed.exists():
         print(f"ERROR: --processed-dir does not exist: {processed}", file=sys.stderr)
         sys.exit(1)
+    output_benchmark = (
+        Path(args.output_benchmark)
+        if args.output_benchmark is not None
+        else _default_benchmark_path(processed, args.course_code)
+    )
     generate_all(
         processed_dir=processed,
         course_code=args.course_code,
-        output_benchmark=Path(args.output_benchmark),
+        output_benchmark=output_benchmark,
         force=args.force,
     )
