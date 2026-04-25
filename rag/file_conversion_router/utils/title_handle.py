@@ -1632,8 +1632,26 @@ def remove_invalid_concepts(
 # SlideQA Page-Level QA Generation
 # ========================
 
+
+def _normalize_for_match(text: str) -> str:
+    """Lowercase + collapse whitespace — used for dedup of question_text."""
+    return re.sub(r"\s+", " ", text.strip().lower())
+
+
+def _is_slideqa_pair_grounded(pair: Dict[str, Any]) -> bool:
+    """Return True if the pair's answer is not a known unanswerable marker.
+
+    For visual question types (type_ii–v) grounding cannot be verified against
+    text alone (the evidence is in the image); we rely on prompt instructions to
+    stay factual.  The only thing rejected here is explicit hedging phrases that
+    indicate the model failed to skip a type as instructed.
+    """
+    answer = str(pair.get("answer", "")).strip().lower()
+    return not any(marker in answer for marker in _SLIDEQA_UNANSWERABLE_MARKERS)
+
+
 _SLIDEQA_VALID_QUESTION_TYPES = frozenset(
-    {"type_i", "type_ii", "type_iii", "type_iv", "type_v"}
+    {"type_iii", "type_iv", "type_v"}
 )
 _SLIDEQA_REQUIRED_KEYS = frozenset(
     {"question_text", "answer", "question_type", "evidence_modality"}
@@ -1649,11 +1667,6 @@ _SLIDEQA_UNANSWERABLE_MARKERS = (
     "n/a",
 )
 
-# Previous wording kept here for easy restore:
-# Do NOT force all five question types. If a type has no clear evidence, skip it.
-# It is acceptable to return only type_i for text-heavy pages.
-#   - type_i  (text-only): answerable from slide text alone.
-#   - type_ii (image-dependent / diagram): requires interpreting a diagram or figure.
 _SLIDEQA_PROMPT_TEMPLATE_TEXT_ONLY = """\
 You are an expert educator creating a question-answer dataset from a single \
 lecture slide page.
@@ -1698,14 +1711,6 @@ JSON schema for each element:
 ]
 """
 
-# Previous wording kept here for easy restore:
-# Generate QA pairs covering ALL five question types listed below.
-# Skip a type only if the page contains absolutely no relevant content for it.
-# For type_ii, type_iii, type_iv, and type_v, base your questions and answers
-# on what you can actually see in the attached images, not just the text.
-#   - type_i  (text-only): answerable from slide text alone.
-#   - type_ii (image-dependent / diagram): requires interpreting a diagram or figure
-#     visible in the images.
 _SLIDEQA_PROMPT_TEMPLATE_VISION = """\
 You are an expert educator creating a question-answer dataset from a single \
 lecture slide page.
@@ -1784,7 +1789,7 @@ def get_slideqa_pairs_for_page(
     variant: str,
     image_paths: Optional[List[Path]] = None,
 ) -> List[Dict[str, Any]]:
-    """Generate SlideQA pairs (types i–v) for one whole slide page.
+    """Generate SlideQA pairs (types iii–v) for one whole slide page.
 
     When image_paths is provided and non-empty, the OpenAI call uses a vision
     model (gpt-4o-mini supports vision) and includes base64-encoded image_url
@@ -1876,7 +1881,7 @@ def get_slideqa_pairs_for_page(
         if not q_norm or q_norm in seen_questions:
             continue
 
-        if not _is_slideqa_pair_grounded(pair, page_text):
+        if not _is_slideqa_pair_grounded(pair):
             logger.warning("SlideQA pair appears ungrounded; dropping question: %s", pair.get("question_text"))
             continue
 

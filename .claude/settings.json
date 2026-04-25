@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest tests/slideqa/test_slideqa_generation.py -q)",
+      "Bash(python -m pytest tests/slideqa/test_run_eval.py tests/slideqa/test_slideqa_generation.py -q)",
+      "Bash(python -m pytest tests/slideqa/test_run_eval.py tests/slideqa/test_slideqa_generation.py -v)"
+    ]
+  }
+}

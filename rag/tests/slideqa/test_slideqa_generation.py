@@ -49,8 +49,8 @@ from file_conversion_router.utils.title_handle import get_slideqa_pairs_for_page
 _VALID_PAIR = {
     "question_text": "What is attention?",
     "answer": "A weighting mechanism.",
-    "question_type": "type_i",
-    "evidence_modality": "text_only",
+    "question_type": "type_iii",
+    "evidence_modality": "table",
     "gold_page_ids": [],
 }
 
