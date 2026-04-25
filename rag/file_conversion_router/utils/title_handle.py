@@ -1649,6 +1649,11 @@ _SLIDEQA_UNANSWERABLE_MARKERS = (
     "n/a",
 )
 
+# Previous wording kept here for easy restore:
+# Do NOT force all five question types. If a type has no clear evidence, skip it.
+# It is acceptable to return only type_i for text-heavy pages.
+#   - type_i  (text-only): answerable from slide text alone.
+#   - type_ii (image-dependent / diagram): requires interpreting a diagram or figure.
 _SLIDEQA_PROMPT_TEMPLATE_TEXT_ONLY = """\
 You are an expert educator creating a question-answer dataset from a single \
 lecture slide page.
@@ -1661,11 +1666,9 @@ Page content (index variant: {variant}):
 Generate only HIGH-CONFIDENCE QA pairs that are directly answerable from the \
 page content shown above.
 
-Do NOT force all five question types. If a type has no clear evidence, skip it.
-It is acceptable to return only type_i for text-heavy pages.
+For the current experiment, generate ONLY type_iii, type_iv, and type_v. \
+If none of type_iii/type_iv/type_v has clear evidence on this page, return [].
 
-  - type_i  (text-only): answerable from slide text alone.
-  - type_ii (image-dependent / diagram): requires interpreting a diagram or figure.
   - type_iii (table-centric): requires reading or comparing table values.
   - type_iv (chart/graph): about chart trends, axis values, or legend.
   - type_v  (layout-dependent): about spatial relationships in multi-panel layouts.
@@ -1675,24 +1678,34 @@ Rules:
 2. Answers must be short, specific, and factual.
 3. Do NOT ask vague questions (e.g., "What is this slide about?") unless the exact title is explicitly present.
 4. Do NOT output placeholders, uncertainty, or hedging (e.g., "not mentioned", "unknown", "cannot determine").
-5. Prefer 3-8 high-quality pairs over many low-quality pairs.
-6. Avoid duplicates or near-duplicates.
-7. If there is no reliable question, return [].
-2. gold_page_ids must be an empty list []; the caller will fill in the real page IDs.
-3. Return ONLY a JSON array — no markdown fences, no extra keys.
+5. Prefer questions that test the main idea, a key definition, or an important relationship over trivial word lookup.
+6. Do NOT create fill-in-the-blank, copy-the-phrase, or single-token lookup questions.
+7. Prefer 3-8 high-quality pairs over many low-quality pairs.
+8. Avoid duplicates or near-duplicates.
+9. If there is no reliable question, return [].
+10. gold_page_ids must be an empty list []; the caller will fill in the real page IDs.
+11. Return ONLY a JSON array — no markdown fences, no extra keys.
 
 JSON schema for each element:
 [
   {{
     "question_text": "string",
     "answer": "string",
-    "question_type": "type_i | type_ii | type_iii | type_iv | type_v",
-    "evidence_modality": "text_only | visual | table | chart | layout",
+    "question_type": "type_iii | type_iv | type_v",
+    "evidence_modality": "table | chart | layout",
     "gold_page_ids": []
   }}
 ]
 """
 
+# Previous wording kept here for easy restore:
+# Generate QA pairs covering ALL five question types listed below.
+# Skip a type only if the page contains absolutely no relevant content for it.
+# For type_ii, type_iii, type_iv, and type_v, base your questions and answers
+# on what you can actually see in the attached images, not just the text.
+#   - type_i  (text-only): answerable from slide text alone.
+#   - type_ii (image-dependent / diagram): requires interpreting a diagram or figure
+#     visible in the images.
 _SLIDEQA_PROMPT_TEMPLATE_VISION = """\
 You are an expert educator creating a question-answer dataset from a single \
 lecture slide page.
@@ -1707,14 +1720,11 @@ Page content (index variant: {variant}):
 {page_text}
 ```
 
-Generate QA pairs covering ALL five question types listed below. \
-Skip a type only if the page contains absolutely no relevant content for it. \
-For type_ii, type_iii, type_iv, and type_v, base your questions and answers \
-on what you can actually see in the attached images, not just the text.
+For the current experiment, generate ONLY type_iii, type_iv, and type_v. \
+Skip a type if the page contains no reliable evidence for it. Base your \
+questions and answers on what you can actually see in the attached images, \
+not just the text.
 
-  - type_i  (text-only): answerable from slide text alone.
-  - type_ii (image-dependent / diagram): requires interpreting a diagram or figure \
-visible in the images.
   - type_iii (table-centric): requires reading or comparing table values visible \
 in the images.
   - type_iv (chart/graph): about chart trends, axis values, or legend visible \
@@ -1723,17 +1733,27 @@ in the images.
 visible in the images.
 
 Rules:
-1. Each answer must be grounded in the page content or the attached images.
-2. gold_page_ids must be an empty list []; the caller will fill in the real page IDs.
-3. Return ONLY a JSON array — no markdown fences, no extra keys.
+1. Each question and answer must be grounded in the page content or the attached images.
+2. For visual questions, prioritize whole-slide understanding over local detail lookup.
+3. Do NOT create fill-in-the-blank questions, OCR-style word spotting questions, or questions that only ask for a single isolated label, number, or cell unless that detail is central to the slide's meaning.
+4. For diagrams and figures, ask about the role of components, the process, the comparison, or the takeaway shown by the visual, not just "what text appears in this box".
+5. For tables, prefer questions about comparisons, rankings, patterns, or what the table demonstrates; avoid asking for a random cell value when no interpretation is needed.
+6. For charts and graphs, prefer questions about trends, relative differences, peaks/lows, legend meaning, or what the chart shows overall; avoid asking for an arbitrary exact number unless it is a key takeaway.
+7. For layout-based questions, ask about relationships across panels, sections, or spatial groupings, not just where an item is located in isolation.
+8. Answers must be short, specific, and factual.
+9. Avoid duplicates or near-duplicates.
+10. If there is no reliable visual question for a type, skip that type instead of forcing it.
+11. Prefer 3-8 high-quality pairs over many low-quality pairs.
+12. gold_page_ids must be an empty list []; the caller will fill in the real page IDs.
+13. Return ONLY a JSON array — no markdown fences, no extra keys.
 
 JSON schema for each element:
 [
   {{
     "question_text": "string",
     "answer": "string",
-    "question_type": "type_i | type_ii | type_iii | type_iv | type_v",
-    "evidence_modality": "text_only | visual | table | chart | layout",
+    "question_type": "type_iii | type_iv | type_v",
+    "evidence_modality": "table | chart | layout",
     "gold_page_ids": []
   }}
 ]
