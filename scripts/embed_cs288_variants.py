@@ -255,6 +255,7 @@ def build_slideqa_db_from_disk(
     model_name: str = "Qwen/Qwen3-Embedding-4B",
     variants: Optional[list[str]] = None,
     batch_size: int = 32,
+    max_seq_length: Optional[int] = None,
     model=None,
 ) -> dict[str, int]:
     """Build a slideqa.db by walking ``processed_dir`` recursively.
@@ -294,6 +295,13 @@ def build_slideqa_db_from_disk(
             ) from exc
         logger.info("Loading model %s", model_name)
         model = SentenceTransformer(model_name)
+
+    if max_seq_length is not None:
+        try:
+            model.max_seq_length = int(max_seq_length)
+            logger.info("Set model.max_seq_length = %d", model.max_seq_length)
+        except Exception as exc:
+            logger.warning("Could not set max_seq_length: %s", exc)
 
     # ----- Phase 1: collect per-(lecture, page_idx) variant texts -------------
     # We collect every (lecture_id, page_idx, variant_text) up front so the
@@ -368,6 +376,12 @@ def build_slideqa_db_from_disk(
             logger.info("[%s] encoding %d page texts", variant, len(items))
             texts = [it["text"] for it in items]
 
+            try:
+                import torch  # only needed for empty_cache; optional
+                _has_torch = True
+            except ImportError:
+                _has_torch = False
+
             all_vecs: list[np.ndarray] = []
             for start in range(0, len(texts), batch_size):
                 batch = texts[start: start + batch_size]
@@ -375,6 +389,9 @@ def build_slideqa_db_from_disk(
                 if isinstance(vecs, np.ndarray) and vecs.ndim == 1:
                     vecs = vecs[np.newaxis, :]
                 all_vecs.append(np.asarray(vecs, dtype=np.float32))
+                # Help avoid CUDA fragmentation on long-text batches.
+                if _has_torch and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
             matrix = np.vstack(all_vecs)
             n_written = 0
@@ -481,7 +498,20 @@ def _build_parser() -> argparse.ArgumentParser:
         "--batch-size",
         type=int,
         default=32,
-        help="Texts per encode() call.",
+        help=(
+            "Texts per encode() call. Lower this (e.g. 4 or 8) if you hit "
+            "CUDA OOM with large embedding models like Qwen3-Embedding-4B."
+        ),
+    )
+    p.add_argument(
+        "--max-seq-length",
+        type=int,
+        default=None,
+        help=(
+            "Override SentenceTransformer.max_seq_length (in tokens) before "
+            "encoding. Useful to cap activation memory on long page texts. "
+            "Try 1024 or 512 if you hit CUDA OOM."
+        ),
     )
     return p
 
@@ -509,6 +539,7 @@ def main(argv: list[str] | None = None) -> int:
         model_name=args.model,
         variants=variants,
         batch_size=args.batch_size,
+        max_seq_length=args.max_seq_length,
     )
 
     print()
