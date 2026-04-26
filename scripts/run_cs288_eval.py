@@ -35,7 +35,9 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import random
 import sys
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Optional
 
@@ -72,6 +74,52 @@ def _filter_by_variant(questions: list[dict], variant: str) -> list[dict]:
     return [q for q in questions if q.get("variant") == variant]
 
 
+def _filter_by_types(
+    questions: list[dict], allowed_types: Optional[set[str]]
+) -> list[dict]:
+    """Drop questions whose ``question_type`` is not in ``allowed_types``."""
+    if not allowed_types:
+        return questions
+    return [q for q in questions if q.get("question_type") in allowed_types]
+
+
+def _stratified_sample(
+    questions: list[dict],
+    max_per_type: Optional[int],
+    seed: int,
+) -> list[dict]:
+    """Stratified down-sample by ``question_type``.
+
+    Each ``question_type`` bucket is independently shuffled (deterministically,
+    using ``seed``) and truncated to ``max_per_type`` items. When ``max_per_type``
+    is None the input is returned unchanged.
+
+    The sample is balanced across types — useful when one type dominates the
+    benchmark (e.g. type_i = 11K but type_ii = 45 in CS 288). Stratifying
+    keeps rare types fully represented while capping the common ones.
+    """
+    if max_per_type is None or max_per_type <= 0:
+        return questions
+
+    rng = random.Random(seed)
+    by_type: dict[str, list[dict]] = defaultdict(list)
+    for q in questions:
+        by_type[q.get("question_type", "unknown")].append(q)
+
+    sampled: list[dict] = []
+    for qtype, bucket in by_type.items():
+        rng.shuffle(bucket)
+        sampled.extend(bucket[:max_per_type])
+
+    rng.shuffle(sampled)
+    return sampled
+
+
+def _type_breakdown(questions: list[dict]) -> dict[str, int]:
+    """Count questions by ``question_type``; convenient for logging."""
+    return dict(Counter(q.get("question_type", "unknown") for q in questions))
+
+
 def _make_retrieve_fn(retriever: Retriever, course_code: Optional[str]):
     """Wrap retriever.retrieve into the callable expected by eval functions.
 
@@ -85,6 +133,24 @@ def _make_retrieve_fn(retriever: Retriever, course_code: Optional[str]):
             top_k=top_k,
         )
     return retrieve_fn
+
+
+def _eval_subset(
+    questions: list[dict],
+    retrieve_fn,
+    variant: str,
+    course_code: Optional[str],
+) -> dict[str, float]:
+    """Compute retrieval metrics over an arbitrary subset of questions."""
+    if not questions:
+        return {"n": 0, "recall@1": 0.0, "recall@3": 0.0, "recall@5": 0.0, "mrr@5": 0.0}
+    return {
+        "n": len(questions),
+        "recall@1": round(recall_at_k(questions, retrieve_fn, variant, course_code, k=1), 4),
+        "recall@3": round(recall_at_k(questions, retrieve_fn, variant, course_code, k=3), 4),
+        "recall@5": round(recall_at_k(questions, retrieve_fn, variant, course_code, k=5), 4),
+        "mrr@5":    round(mrr(questions, retrieve_fn, variant, course_code, k=5), 4),
+    }
 
 
 def _eval_variant(
@@ -130,6 +196,15 @@ def _eval_variant(
     if predicted_answers is not None:
         ca_rate = round(contains_answer_rate(questions, predicted_answers), 4)
 
+    # Per-type breakdown (R@k, MRR@5 within each question_type bucket).
+    by_type: dict[str, list[dict]] = defaultdict(list)
+    for q in questions:
+        by_type[q.get("question_type", "unknown")].append(q)
+    per_type = {
+        qtype: _eval_subset(qs, retrieve_fn, variant, course_code)
+        for qtype, qs in sorted(by_type.items())
+    }
+
     return {
         "variant": variant,
         "n_questions": len(questions),
@@ -140,6 +215,7 @@ def _eval_variant(
         # citation_hit_rate needs a QA agent — placeholder for now.
         "citation_hit_rate": None,
         "contains_answer_rate": ca_rate,
+        "per_type": per_type,
     }
 
 
@@ -151,7 +227,7 @@ def _fmt(val: Optional[float], width: int = 8) -> str:
 
 
 def _print_table(results: list[dict]) -> None:
-    """Print a readable summary table to stdout."""
+    """Print a readable summary table (overall + per-type) to stdout."""
     header = (
         f"{'Variant':<10} {'N':>6} {'R@1':>7} {'R@3':>7} {'R@5':>7}"
         f" {'MRR@5':>8} {'ContainsAns':>12}"
@@ -164,6 +240,28 @@ def _print_table(results: list[dict]) -> None:
             f"{_fmt(r['recall@1'], 7)} {_fmt(r['recall@3'], 7)} {_fmt(r['recall@5'], 7)}"
             f" {_fmt(r['mrr@5'], 8)} {_fmt(r['contains_answer_rate'], 12)}"
         )
+
+    # Per-type breakdown — only print when we have it.
+    have_per_type = any(r.get("per_type") for r in results)
+    if not have_per_type:
+        print()
+        return
+
+    sub_header = (
+        f"{'Variant':<10} {'Type':<10} {'N':>6} "
+        f"{'R@1':>7} {'R@3':>7} {'R@5':>7} {'MRR@5':>8}"
+    )
+    print("\n" + sub_header)
+    print("-" * len(sub_header))
+    for r in results:
+        per_type = r.get("per_type") or {}
+        for qtype in sorted(per_type.keys()):
+            m = per_type[qtype]
+            print(
+                f"{r['variant']:<10} {qtype:<10} {m['n']:>6} "
+                f"{_fmt(m['recall@1'], 7)} {_fmt(m['recall@3'], 7)} "
+                f"{_fmt(m['recall@5'], 7)} {_fmt(m['mrr@5'], 8)}"
+            )
     print()
 
 
@@ -174,14 +272,47 @@ def _save_json(results: list[dict], output_dir: Path) -> Path:
 
 
 def _save_csv(results: list[dict], output_dir: Path) -> Path:
+    """Write the overall (per-variant) metrics to CSV.
+
+    The ``per_type`` nested dict is dropped from the CSV (it's preserved in
+    the JSON output); a separate per-type CSV is written by ``_save_per_type_csv``.
+    """
     out = output_dir / "cs288_eval_results.csv"
     if not results:
         return out
-    fields = list(results[0].keys())
+    flat = [{k: v for k, v in r.items() if k != "per_type"} for r in results]
+    fields = list(flat[0].keys())
     with out.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=fields)
         writer.writeheader()
-        writer.writerows(results)
+        writer.writerows(flat)
+    return out
+
+
+def _save_per_type_csv(results: list[dict], output_dir: Path) -> Optional[Path]:
+    """Write the per-(variant, type) metrics to a separate CSV, if present."""
+    rows: list[dict] = []
+    for r in results:
+        per_type = r.get("per_type") or {}
+        for qtype, m in per_type.items():
+            rows.append(
+                {
+                    "variant": r["variant"],
+                    "question_type": qtype,
+                    "n": m["n"],
+                    "recall@1": m["recall@1"],
+                    "recall@3": m["recall@3"],
+                    "recall@5": m["recall@5"],
+                    "mrr@5": m["mrr@5"],
+                }
+            )
+    if not rows:
+        return None
+    out = output_dir / "cs288_eval_results_by_type.csv"
+    with out.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
     return out
 
 
@@ -220,6 +351,9 @@ def run_eval(
     output_dir: Path,
     embedding_model: str,
     predictions_path: Optional[Path] = None,
+    max_per_type: Optional[int] = None,
+    question_types: Optional[set[str]] = None,
+    seed: int = 0,
 ) -> None:
     """Load benchmark, run retrieval for each variant, compute metrics, save results.
 
@@ -253,7 +387,17 @@ def run_eval(
 
     for variant in ("v1", "v2", "v3"):
         variant_qs = _filter_by_variant(all_questions, variant)
-        print(f"\nEvaluating {variant} ({len(variant_qs)} questions)...")
+        variant_qs = _filter_by_types(variant_qs, question_types)
+        before = len(variant_qs)
+        variant_qs = _stratified_sample(variant_qs, max_per_type, seed)
+        breakdown = _type_breakdown(variant_qs)
+        sampled_note = (
+            f" (stratified sample {len(variant_qs)}/{before}, max_per_type={max_per_type})"
+            if max_per_type
+            else ""
+        )
+        print(f"\nEvaluating {variant} ({len(variant_qs)} questions){sampled_note}")
+        print(f"  type breakdown: {breakdown}")
 
         # Build aligned predicted-answer list for this variant (None entries for missing).
         predicted: Optional[list[str]] = None
@@ -273,7 +417,10 @@ def run_eval(
 
     json_out = _save_json(results, output_dir)
     csv_out = _save_csv(results, output_dir)
+    per_type_csv = _save_per_type_csv(results, output_dir)
     print(f"Results saved:\n  {json_out}\n  {csv_out}")
+    if per_type_csv is not None:
+        print(f"  {per_type_csv}")
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +461,30 @@ def _parse_args() -> argparse.Namespace:
         help="SentenceTransformer model for query embedding (default: Qwen/Qwen3-Embedding-4B).",
     )
     parser.add_argument(
+        "--max-per-type",
+        type=int,
+        default=None,
+        help=(
+            "If set, stratified down-sample each question_type bucket to at most "
+            "this many questions per variant before evaluating. Useful when the "
+            "benchmark is large/skewed (e.g. CS288 has 11K type_i but only 45 type_ii)."
+        ),
+    )
+    parser.add_argument(
+        "--question-types",
+        default=None,
+        help=(
+            "Comma-separated list of question_type values to keep "
+            "(e.g. 'type_i,type_iii'). Default: keep all types."
+        ),
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Random seed for stratified sampling (default: 0).",
+    )
+    parser.add_argument(
         "--predictions-file",
         default=None,
         type=Path,
@@ -340,6 +511,10 @@ if __name__ == "__main__":
 
     course_code = None if args.course_code == "all" else args.course_code
 
+    qtypes: Optional[set[str]] = None
+    if args.question_types:
+        qtypes = {t.strip() for t in args.question_types.split(",") if t.strip()}
+
     run_eval(
         benchmark_path=args.benchmark,
         db_path=args.db_path,
@@ -347,4 +522,7 @@ if __name__ == "__main__":
         output_dir=args.output_dir,
         embedding_model=args.embedding_model,
         predictions_path=args.predictions_file,
+        max_per_type=args.max_per_type,
+        question_types=qtypes,
+        seed=args.seed,
     )
