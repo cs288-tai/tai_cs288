@@ -165,7 +165,7 @@ class TestMetadataRetrieval:
         db, v_q = self._setup(tmp_path)
         r = _mock_retriever(db, v_q)
         results = r.retrieve("query", index_variant="v1", course_code="CS 288", top_k=2)
-        assert results[0].page_number == 8  # chunk_index=7 → page_number=8 (1-based)
+        assert results[0].page_number == 7  # chunk_index=7 (1-based) → page_number=7
 
     def test_top_k_limits_results(self, tmp_path):
         db, v_q = self._setup(tmp_path)
@@ -246,8 +246,11 @@ class TestLecturePageMapping:
         results = r.retrieve("q", "v1", "CS 288", top_k=1)
         assert results[0].lecture_id == "CS288_sp26_07_Transformers.pdf"
 
-    def test_page_number_is_chunk_index_plus_one(self, tmp_path):
-        """page_number = chunk_index + 1 so eval.py's (page_number-1) == chunk_index == gold_page_id."""
+    def test_page_number_equals_chunk_index(self, tmp_path):
+        """page_number == chunk_index because chunk_index is 1-based in the metadata DB.
+        eval.py checks (page_number - 1) in gold_set, where gold_page_ids are 0-based.
+        chunk_index=6 (1-based) → page_number=6 → eval: (6-1)=5 in gold_set.
+        """
         db = _make_metadata_db(tmp_path)
         conn = sqlite3.connect(str(db))
         v_q = _unit_vec(7)
@@ -256,8 +259,8 @@ class TestLecturePageMapping:
 
         r = _mock_retriever(db, v_q)
         results = r.retrieve("q", "v1", "CS 288", top_k=1)
-        # chunk_index=6 (0-based) → page_number=7 (1-based)
-        assert results[0].page_number == 7
+        # chunk_index=6 (1-based) → page_number=6; eval: (6-1)=5 == gold_page_id=5
+        assert results[0].page_number == 6
 
     def test_ocr_text_comes_from_chunk_text(self, tmp_path):
         db = _make_metadata_db(tmp_path)
@@ -328,14 +331,17 @@ class TestRetrieveFnCompat:
 
     def test_page_number_offset_matches_gold_page_id_convention(self, tmp_path):
         """
-        chunk_index=6 (0-based) == gold_page_id=6.
+        chunk_index is 1-based in the metadata DB.
+        gold_page_ids are 0-based (MinerU page_idx).
         eval.py checks: (page_number - 1) in gold_set
-        So page_number must be chunk_index + 1 = 7, giving (7-1)=6 == gold_page_id.
+        So page_number = chunk_index, giving (chunk_index - 1) == gold_page_id.
+        Example: chunk_index=7 (1-based, the 7th slide) → page_number=7
+                 gold_page_id=6 (0-based, the 7th slide) → (7-1)=6 ✓
         """
         db = _make_metadata_db(tmp_path)
         conn = sqlite3.connect(str(db))
         v_q = _unit_vec(1)
-        _insert_chunk(conn, "c1", "CS 288/slides/lec.pdf", 6, v_q)  # chunk_index=6
+        _insert_chunk(conn, "c1", "CS 288/slides/lec.pdf", 7, v_q)  # chunk_index=7 (1-based)
         conn.commit(); conn.close()
 
         r = _mock_retriever(db, v_q)
@@ -343,3 +349,26 @@ class TestRetrieveFnCompat:
         pn = results[0].page_number  # should be 7
         gold_page_id = pn - 1        # eval.py offset → should be 6
         assert gold_page_id == 6
+
+    def test_query_prefix_forwarded_to_model_encode(self, tmp_path):
+        """retrieve() must prepend the Qwen3 instruction prefix before encoding."""
+        from slideqa.metadata_retriever import _QUERY_PREFIX
+
+        db = _make_metadata_db(tmp_path)
+        conn = sqlite3.connect(str(db))
+        v_q = _unit_vec(0)
+        _insert_chunk(conn, "c1", "CS 288/slides/lec.pdf", 1, v_q)
+        conn.commit(); conn.close()
+
+        r = MetadataDBRetriever(db_path=db, model_name="fake-model")
+        mock_model = MagicMock()
+        mock_model.encode.return_value = v_q
+        r._model = mock_model
+
+        r.retrieve("my question", index_variant="v1", course_code="CS 288", top_k=1)
+
+        call_arg = mock_model.encode.call_args[0][0]
+        assert call_arg.startswith(_QUERY_PREFIX), (
+            f"Expected encode() called with prefix, got: {call_arg!r}"
+        )
+        assert "my question" in call_arg

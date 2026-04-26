@@ -343,6 +343,29 @@ class TestChunkRetrieval:
         assert len(results) == 1
         assert results[0].page_number == 1
 
+    def test_query_prefix_forwarded_to_model_encode(self, tmp_path):
+        """retrieve() must prepend the Qwen3 instruction prefix before encoding."""
+        from slideqa.retriever import _QUERY_PREFIX
+
+        db = _make_db(tmp_path)
+        conn = sqlite3.connect(str(db))
+        _insert_page(conn, "p1", 1)
+        _insert_chunk(conn, "p1c0", "p1", "v1", _unit_vec(0))
+        conn.commit(); conn.close()
+
+        r = Retriever(db_path=db, model_name="fake-model")
+        mock_model = MagicMock()
+        mock_model.encode.return_value = _unit_vec(0)
+        r._model = mock_model
+
+        r.retrieve("my question", index_variant="v1", course_code="CS288", top_k=1)
+
+        call_arg = mock_model.encode.call_args[0][0]
+        assert call_arg.startswith(_QUERY_PREFIX), (
+            f"Expected encode() called with prefix, got: {call_arg!r}"
+        )
+        assert "my question" in call_arg
+
 
 # ---------------------------------------------------------------------------
 # D. build_chunk_embeddings (index_builder)

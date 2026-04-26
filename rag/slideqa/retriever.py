@@ -25,6 +25,14 @@ _MAX_TOP_K = 200
 _MIN_RRF_K = 1
 _MAX_CACHE_ENTRIES = 12       # 3 variants × expected course codes
 
+# Qwen3-Embedding asymmetric query prefix — must match encoding of slide chunks.
+# Slide chunks were encoded as: "document_hierarchy_path: {path}\ndocument: {text}\n"
+# Queries must use this instruction prefix so both live in the same embedding space.
+_QUERY_PREFIX = (
+    "Instruct: Given a web search query, retrieve relevant passages that answer the query\n"
+    "Query: "
+)
+
 
 # ---------------------------------------------------------------------------
 # Result dataclass (immutable)
@@ -106,7 +114,7 @@ class Retriever:
 
         # 1. Embed query
         model = self._get_model()
-        raw = model.encode(query)
+        raw = model.encode(_QUERY_PREFIX + query)
         qv = np.array(raw, dtype=np.float32).reshape(-1)
         norm = np.linalg.norm(qv)
         if norm > 0:

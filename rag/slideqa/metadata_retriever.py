@@ -10,12 +10,19 @@ chunks table columns used:
     chunk_index  INTEGER   — 0-based page index (same numbering as gold_page_ids)
     vector       BLOB      — float32 embedding
 
+Chunks were encoded by the TAI pipeline using Qwen/Qwen3-Embedding-4B with
+a document-mode prompt:
+    "document_hierarchy_path: {path}\\ndocument: {text}\\n"
+
+Queries MUST use the matching asymmetric instruction prefix:
+    "Instruct: Given a web search query, retrieve relevant passages that answer the query\\nQuery: {text}"
+
 Mapping to eval pipeline:
-    chunk_index  == gold_page_id  (both 0-based)
-    page_number  = chunk_index + 1  (1-based, as eval.py expects)
+    chunk_index  is 1-based in the metadata DB (first slide = chunk_index=1)
+    gold_page_ids are 0-based MinerU page_idx (first slide = gold_page_id=0)
+    page_number  = chunk_index  (already 1-based; no +1 adjustment needed)
     eval.py checks: (page_number - 1) in gold_set
-                  = (chunk_index + 1 - 1) in gold_set
-                  = chunk_index in gold_set  ✓
+                  = (chunk_index - 1) in gold_set  ✓  (0-based == gold_page_id)
 
 The `variant` parameter is accepted for API compatibility but ignored
 (the metadata DB stores a single embedding per chunk).
@@ -38,6 +45,14 @@ logger = logging.getLogger(__name__)
 _MAX_EMBEDDING_DIM = 16_384
 _MAX_TOP_K = 200
 _MAX_CACHE_ENTRIES = 4
+
+# Qwen3-Embedding asymmetric query prefix — must match what was used to encode chunks.
+# Chunks were encoded as: "document_hierarchy_path: {path}\ndocument: {text}\n"
+# Queries must use this instruction prefix so both live in the same embedding space.
+_QUERY_PREFIX = (
+    "Instruct: Given a web search query, retrieve relevant passages that answer the query\n"
+    "Query: "
+)
 
 
 @dataclass(frozen=True)
@@ -101,7 +116,7 @@ class MetadataDBRetriever:
             raise ValueError(f"top_k must be between 1 and {_MAX_TOP_K}, got {top_k!r}")
 
         model = self._get_model()
-        raw = model.encode(query)
+        raw = model.encode(_QUERY_PREFIX + query)
         qv = np.array(raw, dtype=np.float32).reshape(-1)
         norm = np.linalg.norm(qv)
         if norm > 0:
@@ -208,8 +223,8 @@ class MetadataDBRetriever:
 
             file_path = row["file_path"] or ""
             lecture_id = Path(file_path).name  # last component: "CS288_sp26_01_Intro.pdf"
-            chunk_index = int(row["chunk_index"])  # 0-based, same as gold_page_ids
-            page_number = chunk_index + 1           # eval.py expects 1-based
+            chunk_index = int(row["chunk_index"])  # 1-based in the metadata DB
+            page_number = chunk_index               # already 1-based; eval: (page_number-1)==gold_page_id
             page_id = f"{lecture_id}_page_{chunk_index}"
 
             row_meta.append({
