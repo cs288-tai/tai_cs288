@@ -120,6 +120,87 @@ def _type_breakdown(questions: list[dict]) -> dict[str, int]:
     return dict(Counter(q.get("question_type", "unknown") for q in questions))
 
 
+def _dump_predictions(
+    questions: list[dict],
+    retrieve_fn,
+    variant: str,
+    course_code: Optional[str],
+    out_path: Path,
+    top_k: int = 5,
+    snippet_chars: int = 240,
+) -> None:
+    """Write per-question retrieval details to a JSONL file.
+
+    For each question we run retrieval once at ``top_k`` and record the
+    question, gold page ids, the top-k retrieved pages, and the rank of
+    the first gold hit (None if no hit in top-k). Useful for eyeballing
+    *why* a particular question missed.
+
+    Each output line is a JSON object:
+
+        {
+          "variant": "v1",
+          "question_id": "...",
+          "question_type": "type_iii",
+          "question": "...",
+          "answer_short": "...",
+          "gold_page_ids": [3],
+          "lecture_id": "...",
+          "first_hit_rank": 2,
+          "retrieved": [
+            {"rank": 1, "page_id": "...", "lecture_id": "...",
+             "page_number": 4, "page_idx": 3, "is_hit": false,
+             "score": 0.812, "snippet": "..."}, ...
+          ]
+        }
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as fh:
+        for q in questions:
+            results = retrieve_fn(q["question"], variant, course_code, top_k)
+            gold_set = set(q.get("gold_page_ids") or [])
+
+            retrieved: list[dict] = []
+            first_hit_rank: Optional[int] = None
+            for i, r in enumerate(results, start=1):
+                page_idx = int(r.page_number) - 1  # 1-based → 0-based for comparison
+                is_hit = page_idx in gold_set
+                if is_hit and first_hit_rank is None:
+                    first_hit_rank = i
+                snippet = (r.ocr_text or "")[:snippet_chars].replace("\n", " ").strip()
+                retrieved.append(
+                    {
+                        "rank": i,
+                        "page_id": r.page_id,
+                        "lecture_id": r.lecture_id,
+                        "page_number": r.page_number,  # 1-based
+                        "page_idx": page_idx,          # 0-based, comparable to gold
+                        "is_hit": is_hit,
+                        "score": round(float(r.score), 4),
+                        "dense_score": round(float(r.dense_score), 4),
+                        "snippet": snippet,
+                    }
+                )
+
+            fh.write(
+                json.dumps(
+                    {
+                        "variant": variant,
+                        "question_id": q.get("question_id"),
+                        "question_type": q.get("question_type"),
+                        "question": q.get("question"),
+                        "answer_short": q.get("answer_short"),
+                        "gold_page_ids": sorted(gold_set),
+                        "lecture_id": q.get("lecture_id"),
+                        "first_hit_rank": first_hit_rank,
+                        "retrieved": retrieved,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+
+
 def _make_retrieve_fn(retriever: Retriever, course_code: Optional[str]):
     """Wrap retriever.retrieve into the callable expected by eval functions.
 
@@ -354,6 +435,8 @@ def run_eval(
     max_per_type: Optional[int] = None,
     question_types: Optional[set[str]] = None,
     seed: int = 0,
+    dump_predictions: bool = False,
+    dump_top_k: int = 5,
 ) -> None:
     """Load benchmark, run retrieval for each variant, compute metrics, save results.
 
@@ -412,6 +495,18 @@ def run_eval(
         print(f"  Recall@1={metrics['recall@1']}  Recall@3={metrics['recall@3']}  "
               f"Recall@5={metrics['recall@5']}  MRR@5={metrics['mrr@5']}  "
               f"ContainsAns={metrics['contains_answer_rate']}")
+
+        if dump_predictions:
+            dump_path = output_dir / f"predictions_{variant}.jsonl"
+            print(f"  Dumping per-question retrieval details → {dump_path}")
+            _dump_predictions(
+                variant_qs,
+                retrieve_fn,
+                variant,
+                course_code,
+                dump_path,
+                top_k=dump_top_k,
+            )
 
     _print_table(results)
 
@@ -485,6 +580,22 @@ def _parse_args() -> argparse.Namespace:
         help="Random seed for stratified sampling (default: 0).",
     )
     parser.add_argument(
+        "--dump-predictions",
+        action="store_true",
+        help=(
+            "If set, write a JSONL of per-question retrieval details to "
+            "<output-dir>/predictions_<variant>.jsonl (one file per variant). "
+            "Each line includes the question, gold page ids, top-K retrieved "
+            "pages with snippets, and the rank of the first gold hit."
+        ),
+    )
+    parser.add_argument(
+        "--dump-top-k",
+        type=int,
+        default=5,
+        help="How many retrieved pages to include in --dump-predictions (default 5).",
+    )
+    parser.add_argument(
         "--predictions-file",
         default=None,
         type=Path,
@@ -525,4 +636,6 @@ if __name__ == "__main__":
         max_per_type=args.max_per_type,
         question_types=qtypes,
         seed=args.seed,
+        dump_predictions=args.dump_predictions,
+        dump_top_k=args.dump_top_k,
     )
