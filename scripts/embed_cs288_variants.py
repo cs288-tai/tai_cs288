@@ -486,7 +486,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--model",
-        default="Qwen/Qwen3-Embedding-4B",
+        default="BAAI/bge-m3",
         help="HuggingFace SentenceTransformer model id.",
     )
     p.add_argument(
