@@ -1,9 +1,10 @@
 """
 SQLite index builder for SlideQA records and embeddings.
 
-Schema has two tables:
-- slide_pages  : stores SlidePageRecord fields
-- slide_embeddings : stores float32 BLOBs for v1/v2/v3 embedding variants
+Schema has three tables:
+- slide_pages       : stores SlidePageRecord fields
+- slide_embeddings  : stores float32 BLOBs for v1/v2/v3 embedding variants (page-level)
+- slide_chunks      : stores float32 BLOBs for chunk-level embeddings (chunk→page FK)
 """
 
 from __future__ import annotations
@@ -18,6 +19,11 @@ from typing import Any, Optional
 from rag.slideqa.schema import SlidePageRecord
 
 logger = logging.getLogger(__name__)
+
+try:
+    from sentence_transformers import SentenceTransformer  # type: ignore
+except ImportError:
+    SentenceTransformer = None  # type: ignore[assignment,misc]
 
 _MAX_TEXT_CHARS = 32_000
 
@@ -38,6 +44,14 @@ CREATE TABLE IF NOT EXISTS slide_embeddings (
     vector BLOB NOT NULL,
     FOREIGN KEY (page_id) REFERENCES slide_pages(page_id),
     UNIQUE(page_id, variant)
+);
+CREATE TABLE IF NOT EXISTS slide_chunks (
+    chunk_id   TEXT PRIMARY KEY,
+    page_id    TEXT NOT NULL,
+    variant    TEXT NOT NULL CHECK(variant IN ('v1', 'v2', 'v3')),
+    chunk_text TEXT NOT NULL DEFAULT '',
+    vector     BLOB NOT NULL,
+    FOREIGN KEY (page_id) REFERENCES slide_pages(page_id)
 );
 """
 
@@ -231,8 +245,6 @@ def build_embeddings(
         return 0
 
     if model is None:
-        from sentence_transformers import SentenceTransformer  # type: ignore
-
         logger.info("Loading embedding model %s", model_name)
         model = SentenceTransformer(model_name)
 
@@ -268,6 +280,114 @@ def build_embeddings(
         conn.close()
 
 
+def upsert_chunk_records(db_path: Path, chunks: list[dict]) -> int:
+    """
+    Insert or replace chunk rows in slide_chunks.
+
+    Each dict in chunks must have:
+        chunk_id  (str)  — primary key
+        page_id   (str)  — FK to slide_pages
+        variant   (str)  — "v1", "v2", or "v3"
+        chunk_text (str) — raw text of the chunk
+        vector    (np.ndarray | bytes) — float32 embedding
+
+    Args:
+        db_path: Path to the SQLite database.
+        chunks:  List of chunk dicts to upsert.
+
+    Returns:
+        Number of rows written.
+    """
+    if not chunks:
+        return 0
+
+    db_path = Path(db_path)
+    conn = _connect(db_path)
+    try:
+        rows = []
+        for c in chunks:
+            vec = c["vector"]
+            if isinstance(vec, (bytes, bytearray)):
+                blob = bytes(vec)
+            else:
+                import numpy as np
+                arr = np.asarray(vec, dtype=np.float32)
+                blob = struct.pack(f"{len(arr)}f", *arr.tolist())
+            rows.append((c["chunk_id"], c["page_id"], c["variant"], c.get("chunk_text", ""), blob))
+
+        conn.executemany(
+            """
+            INSERT INTO slide_chunks (chunk_id, page_id, variant, chunk_text, vector)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(chunk_id) DO UPDATE SET
+              page_id    = excluded.page_id,
+              variant    = excluded.variant,
+              chunk_text = excluded.chunk_text,
+              vector     = excluded.vector
+            """,
+            rows,
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) "
+            "VALUES ('last_modified', strftime('%Y-%m-%dT%H:%M:%f', 'now'))"
+        )
+        conn.commit()
+        logger.info("Upserted %d chunk records", len(rows))
+        return len(rows)
+    finally:
+        conn.close()
+
+
+def build_chunk_embeddings(
+    db_path: Path,
+    chunks: list[dict],
+    variant: str,
+    model: Optional[Any] = None,
+    model_name: str = "Qwen/Qwen3-Embedding-4B",
+) -> int:
+    """
+    Encode chunk texts and store float32 BLOBs in slide_chunks.
+
+    Each dict in chunks must have:
+        chunk_id  (str)
+        page_id   (str)
+        chunk_text (str)
+    The variant is taken from the argument, not the dict.
+
+    Args:
+        db_path:    Path to the SQLite database.
+        chunks:     Chunk dicts (without pre-computed vectors).
+        variant:    Embedding variant ("v1", "v2", or "v3").
+        model:      Pre-loaded SentenceTransformer; loaded lazily if None.
+        model_name: HuggingFace model identifier (used when model is None).
+
+    Returns:
+        Number of chunk rows written.
+    """
+    if not chunks:
+        return 0
+
+    if model is None:
+        logger.info("Loading embedding model %s", model_name)
+        model = SentenceTransformer(model_name)
+
+    texts = [c.get("chunk_text", "") for c in chunks]
+    logger.info("Encoding %d chunk texts for variant %s", len(texts), variant)
+    vectors = model.encode(texts, show_progress_bar=False)
+
+    enriched = [
+        {
+            "chunk_id": c["chunk_id"],
+            "page_id": c["page_id"],
+            "variant": variant,
+            "chunk_text": c.get("chunk_text", ""),
+            "vector": vectors[i],
+        }
+        for i, c in enumerate(chunks)
+    ]
+    return upsert_chunk_records(db_path, enriched)
+
+
 def build_all_variants(
     db_path: Path,
     records: list[SlidePageRecord],
@@ -286,8 +406,6 @@ def build_all_variants(
     """
     if not records:
         return {"v1": 0, "v2": 0, "v3": 0}
-
-    from sentence_transformers import SentenceTransformer  # type: ignore
 
     logger.info("Loading embedding model %s (shared across variants)", model_name)
     model = SentenceTransformer(model_name)

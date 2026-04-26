@@ -84,8 +84,15 @@ class Retriever:
         top_k: int = 5,
         use_bm25: bool = False,
         rrf_k: int = 60,
+        chunk_agg: str = "max",
     ) -> list[SlidePageResult]:
-        """Return top_k SlidePageResult sorted by score descending."""
+        """Return top_k SlidePageResult sorted by score descending.
+
+        When the index contains chunk-level embeddings (slide_chunks), each
+        chunk is scored independently and then aggregated to its parent page
+        using chunk_agg ("max", "sum", or "mean").  Falls back to page-level
+        slide_embeddings when no chunks are present for (variant, course_code).
+        """
         if index_variant not in _VALID_VARIANTS:
             raise ValueError(
                 f"Invalid variant {index_variant!r}. Must be one of {sorted(_VALID_VARIANTS)}."
@@ -94,11 +101,12 @@ class Retriever:
             raise ValueError(f"top_k must be between 1 and {_MAX_TOP_K}, got {top_k!r}")
         if not isinstance(rrf_k, int) or rrf_k < _MIN_RRF_K:
             raise ValueError(f"rrf_k must be >= {_MIN_RRF_K}, got {rrf_k!r}")
+        if chunk_agg not in ("max", "sum", "mean"):
+            raise ValueError(f"chunk_agg must be 'max', 'sum', or 'mean', got {chunk_agg!r}")
 
         # 1. Embed query
         model = self._get_model()
         raw = model.encode(query)
-        # Handle shape (1, D) or (D,)
         qv = np.array(raw, dtype=np.float32).reshape(-1)
         norm = np.linalg.norm(qv)
         if norm > 0:
@@ -112,15 +120,23 @@ class Retriever:
             return []
 
         matrix: np.ndarray = idx["M"]   # shape [N, D]
-        page_ids: list[str] = idx["page_ids"]
-        metadata: list[dict[str, Any]] = idx["metadata"]
+        page_ids: list[str] = idx["page_ids"]      # one entry per row (chunk or page)
+        metadata: list[dict[str, Any]] = idx["metadata"]  # parallel to page_ids
+        is_chunk_index: bool = idx.get("is_chunk_index", False)
 
         # 3. Dense cosine scores (dot product on L2-normalised vectors)
         dense_scores: np.ndarray = matrix @ qv  # shape [N]
 
-        # 4. Optionally compute BM25 and combine via RRF
+        # 4. If chunk index: aggregate per-chunk scores to page-level scores.
+        if is_chunk_index:
+            page_ids, metadata, dense_scores = self._aggregate_chunks(
+                page_ids, metadata, dense_scores, chunk_agg
+            )
+
+        # 5. Optionally compute BM25 and combine via RRF (page-level only)
         if use_bm25:
-            bm25_raw = self._compute_bm25(query, idx)
+            page_idx = {"page_ids": page_ids, "metadata": metadata}
+            bm25_raw = self._compute_bm25(query, page_idx)
             final_scores, bm25_scores_map = self._combine_rrf(
                 dense_scores, page_ids, bm25_raw, rrf_k
             )
@@ -128,11 +144,10 @@ class Retriever:
             final_scores = dense_scores
             bm25_scores_map: dict[str, float] = {}
 
-        # 5. Rank and return top_k
+        # 6. Rank and return top_k
         n = len(page_ids)
         k = min(top_k, n)
         if k == n:
-            # argpartition boundary case: just sort all
             top_idx = np.argsort(final_scores)[::-1]
         else:
             top_idx = np.argpartition(final_scores, -k)[-k:]
@@ -229,24 +244,36 @@ class Retriever:
     def _build_index(
         self, variant: str, course_code: Optional[str], dv: int
     ) -> dict[str, Any]:
-        """Query SQLite and build a numpy matrix + metadata lists."""
+        """Query SQLite and build a numpy matrix + metadata lists.
+
+        Prefers chunk-level embeddings (slide_chunks) when available for
+        (variant, course_code).  Falls back to page-level slide_embeddings.
+        The returned dict includes is_chunk_index=True when chunk rows are used
+        so retrieve() knows to aggregate before ranking.
+        """
         conn = sqlite3.connect(str(self._db_path))
         conn.row_factory = sqlite3.Row
         try:
-            query_sql = (
-                "SELECT sp.page_id, sp.course_code, sp.lecture_id, "
-                "sp.page_number, sp.image_path, sp.ocr_text, sp.caption, sp.objects, "
-                "se.vector "
-                "FROM slide_pages sp "
-                "JOIN slide_embeddings se ON sp.page_id = se.page_id "
-                "WHERE se.variant = ?"
+            # Check whether slide_chunks has any rows for this (variant, course_code)
+            chunk_check_sql = (
+                "SELECT COUNT(*) FROM slide_chunks sc "
+                "JOIN slide_pages sp ON sc.page_id = sp.page_id "
+                "WHERE sc.variant = ?"
             )
-            params: list[Any] = [variant]
+            chunk_params: list[Any] = [variant]
             if course_code is not None:
-                query_sql += " AND sp.course_code = ?"
-                params.append(course_code)
+                chunk_check_sql += " AND sp.course_code = ?"
+                chunk_params.append(course_code)
 
-            rows = conn.execute(query_sql, params).fetchall()
+            try:
+                chunk_count = conn.execute(chunk_check_sql, chunk_params).fetchone()[0]
+            except sqlite3.OperationalError:
+                chunk_count = 0  # slide_chunks table does not exist yet
+
+            if chunk_count > 0:
+                rows, is_chunk_index = self._fetch_chunk_rows(conn, variant, course_code)
+            else:
+                rows, is_chunk_index = self._fetch_page_rows(conn, variant, course_code)
         finally:
             conn.close()
 
@@ -257,18 +284,18 @@ class Retriever:
         for row in rows:
             blob = row["vector"]
             if not isinstance(blob, (bytes, bytearray)) or len(blob) % 4 != 0:
-                logger.warning("Skipping page_id %s: malformed vector blob", row["page_id"])
+                logger.warning("Skipping row for page_id %s: malformed vector blob", row["page_id"])
                 continue
             n_floats = len(blob) // 4
             if n_floats == 0 or n_floats > _MAX_EMBEDDING_DIM:
                 logger.warning(
-                    "Skipping page_id %s: vector dimension %d out of range",
+                    "Skipping row for page_id %s: vector dimension %d out of range",
                     row["page_id"], n_floats,
                 )
                 continue
             vec = np.array(struct.unpack(f"{n_floats}f", blob), dtype=np.float32)
 
-            obj_raw = row["objects"]
+            obj_raw = row["objects"] if "objects" in row.keys() else None
             objects: Optional[tuple[str, ...]] = None
             if obj_raw is not None:
                 import json
@@ -285,17 +312,96 @@ class Retriever:
                     "page_number": row["page_number"],
                     "image_path": row["image_path"],
                     "ocr_text": row["ocr_text"] or "",
-                    "caption": row["caption"],
+                    "caption": row["caption"] if "caption" in row.keys() else None,
                     "objects": objects,
                 }
             )
             vectors.append(vec)
 
         if not vectors:
-            return {"dv": dv, "M": None, "page_ids": [], "metadata": []}
+            return {
+                "dv": dv, "M": None, "page_ids": [], "metadata": [],
+                "is_chunk_index": is_chunk_index,
+            }
 
         matrix = np.vstack(vectors).astype(np.float32)
-        return {"dv": dv, "M": matrix, "page_ids": page_ids, "metadata": metadata}
+        return {
+            "dv": dv, "M": matrix, "page_ids": page_ids, "metadata": metadata,
+            "is_chunk_index": is_chunk_index,
+        }
+
+    @staticmethod
+    def _fetch_chunk_rows(
+        conn: sqlite3.Connection, variant: str, course_code: Optional[str]
+    ) -> tuple[list[Any], bool]:
+        """Fetch rows from slide_chunks joined to slide_pages."""
+        sql = (
+            "SELECT sp.page_id, sp.course_code, sp.lecture_id, "
+            "sp.page_number, sp.image_path, sp.ocr_text, sp.caption, sp.objects, "
+            "sc.vector "
+            "FROM slide_chunks sc "
+            "JOIN slide_pages sp ON sc.page_id = sp.page_id "
+            "WHERE sc.variant = ?"
+        )
+        params: list[Any] = [variant]
+        if course_code is not None:
+            sql += " AND sp.course_code = ?"
+            params.append(course_code)
+        return conn.execute(sql, params).fetchall(), True
+
+    @staticmethod
+    def _fetch_page_rows(
+        conn: sqlite3.Connection, variant: str, course_code: Optional[str]
+    ) -> tuple[list[Any], bool]:
+        """Fetch rows from slide_embeddings joined to slide_pages (page-level fallback)."""
+        sql = (
+            "SELECT sp.page_id, sp.course_code, sp.lecture_id, "
+            "sp.page_number, sp.image_path, sp.ocr_text, sp.caption, sp.objects, "
+            "se.vector "
+            "FROM slide_pages sp "
+            "JOIN slide_embeddings se ON sp.page_id = se.page_id "
+            "WHERE se.variant = ?"
+        )
+        params: list[Any] = [variant]
+        if course_code is not None:
+            sql += " AND sp.course_code = ?"
+            params.append(course_code)
+        return conn.execute(sql, params).fetchall(), False
+
+    @staticmethod
+    def _aggregate_chunks(
+        page_ids: list[str],
+        metadata: list[dict[str, Any]],
+        scores: np.ndarray,
+        agg: str,
+    ) -> tuple[list[str], list[dict[str, Any]], np.ndarray]:
+        """Aggregate chunk-level scores to unique page-level scores.
+
+        Returns parallel (page_ids, metadata, scores) lists with one entry
+        per unique page_id, in the order pages are first encountered.
+        """
+        # Collect scores per page, preserving first-seen metadata
+        page_scores: dict[str, list[float]] = {}
+        page_meta: dict[str, dict[str, Any]] = {}
+        for i, pid in enumerate(page_ids):
+            if pid not in page_scores:
+                page_scores[pid] = []
+                page_meta[pid] = metadata[i]
+            page_scores[pid].append(float(scores[i]))
+
+        unique_pids = list(page_scores.keys())
+        agg_meta = [page_meta[pid] for pid in unique_pids]
+        agg_vals: list[float] = []
+        for pid in unique_pids:
+            s = page_scores[pid]
+            if agg == "max":
+                agg_vals.append(max(s))
+            elif agg == "sum":
+                agg_vals.append(sum(s))
+            else:  # mean
+                agg_vals.append(sum(s) / len(s))
+
+        return unique_pids, agg_meta, np.array(agg_vals, dtype=np.float32)
 
     def _compute_bm25(
         self, query: str, idx: dict[str, Any]
