@@ -3,7 +3,16 @@
     "allow": [
       "Bash(python -m pytest tests/slideqa/test_slideqa_generation.py -q)",
       "Bash(python -m pytest tests/slideqa/test_run_eval.py tests/slideqa/test_slideqa_generation.py -q)",
-      "Bash(python -m pytest tests/slideqa/test_run_eval.py tests/slideqa/test_slideqa_generation.py -v)"
+      "Bash(python -m pytest tests/slideqa/test_run_eval.py tests/slideqa/test_slideqa_generation.py -v)",
+      "Bash(wc -l /Users/runjiezhang/Desktop/tai_cs288/data/cs288_benchmark_*.jsonl)",
+      "Bash(python3 -c ' *)",
+      "Bash(python -m pytest tests/slideqa/test_run_eval_breakdown.py -q)",
+      "Bash(python -m pytest tests/slideqa/test_run_eval_breakdown.py -v)",
+      "Bash(python -m pytest tests/slideqa/test_run_eval_breakdown.py::TestClassifyError::test_answer_miss_when_retrieval_correct_but_answer_wrong -v)",
+      "Bash(python -m pytest tests/slideqa/test_run_eval_breakdown.py::TestEvaluateSplitByGroup::test_recall_per_group tests/slideqa/test_run_eval_breakdown.py::TestErrorAnalysis::test_error_record_has_required_fields -v)",
+      "Bash(python -m pytest tests/slideqa/test_run_eval_breakdown.py::TestEvaluateSplitByGroup::test_recall_per_group -v)",
+      "Bash(python -m pytest tests/slideqa/test_run_eval_breakdown.py tests/slideqa/test_run_eval.py tests/slideqa/test_slideqa_generation.py -q)",
+      "Bash(sqlite3 \"/Users/runjiezhang/Desktop/tai_cs288/data/CS 288_metadata_new.db\" \"SELECT COUNT\\(*\\) FROM chunks;\")"
     ]
   }
 }
