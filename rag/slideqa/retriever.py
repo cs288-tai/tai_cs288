@@ -25,13 +25,34 @@ _MAX_TOP_K = 200
 _MIN_RRF_K = 1
 _MAX_CACHE_ENTRIES = 12       # 3 variants × expected course codes
 
-# Qwen3-Embedding asymmetric query prefix — must match encoding of slide chunks.
-# Slide chunks were encoded as: "document_hierarchy_path: {path}\ndocument: {text}\n"
-# Queries must use this instruction prefix so both live in the same embedding space.
-_QUERY_PREFIX = (
+# Qwen3-Embedding is *asymmetric* and was trained with this instruction:
+# Slide chunks for Qwen are encoded as "document_hierarchy_path: {path}\ndocument: {text}\n"
+# and queries must wear the matching "Instruct: ... Query: " hat to live in the
+# same embedding space.
+#
+# Other encoders (bge-m3, e5-*, gte-*, etc.) are *symmetric* — the same encoder
+# is used for queries and documents, and adding an instruction prefix actively
+# *hurts* retrieval by pulling every query toward the same boilerplate point.
+#
+# We therefore only apply the prefix when the loaded model is from the Qwen
+# embedding family. For everything else we send the raw query through.
+_QWEN_QUERY_PREFIX = (
     "Instruct: Given a web search query, retrieve relevant passages that answer the query\n"
     "Query: "
 )
+
+
+def _query_prefix_for_model(model_name: str) -> str:
+    """Return the query-side instruction prefix (or "") for ``model_name``.
+
+    Empty string means: encode the raw query with no prefix. Used for symmetric
+    encoders like bge-m3 / e5 / gte where adding an instruction degrades
+    retrieval.
+    """
+    name = (model_name or "").lower()
+    if "qwen3-embedding" in name or "qwen-embedding" in name:
+        return _QWEN_QUERY_PREFIX
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -112,9 +133,11 @@ class Retriever:
         if chunk_agg not in ("max", "sum", "mean"):
             raise ValueError(f"chunk_agg must be 'max', 'sum', or 'mean', got {chunk_agg!r}")
 
-        # 1. Embed query
+        # 1. Embed query — only Qwen embeddings need the instruction prefix;
+        #    symmetric models (bge-m3, e5, gte, ...) must receive the raw query.
         model = self._get_model()
-        raw = model.encode(_QUERY_PREFIX + query)
+        prefix = _query_prefix_for_model(self._model_name)
+        raw = model.encode(prefix + query)
         qv = np.array(raw, dtype=np.float32).reshape(-1)
         norm = np.linalg.norm(qv)
         if norm > 0:

@@ -201,10 +201,17 @@ def _dump_predictions(
             )
 
 
-def _make_retrieve_fn(retriever: Retriever, course_code: Optional[str]):
+def _make_retrieve_fn(
+    retriever: Retriever,
+    course_code: Optional[str],
+    use_bm25: bool = False,
+    rrf_k: int = 60,
+):
     """Wrap retriever.retrieve into the callable expected by eval functions.
 
-    Signature expected by eval: (query, variant, course_code, top_k) -> results
+    Signature expected by eval: (query, variant, course_code, top_k) -> results.
+    When ``use_bm25`` is True we let the retriever combine dense + BM25 with RRF;
+    short-text slide retrieval typically benefits from this hybrid.
     """
     def retrieve_fn(query: str, variant: str, course_code: Optional[str], top_k: int):
         return retriever.retrieve(
@@ -212,6 +219,8 @@ def _make_retrieve_fn(retriever: Retriever, course_code: Optional[str]):
             index_variant=variant,
             course_code=course_code,
             top_k=top_k,
+            use_bm25=use_bm25,
+            rrf_k=rrf_k,
         )
     return retrieve_fn
 
@@ -437,6 +446,8 @@ def run_eval(
     seed: int = 0,
     dump_predictions: bool = True,
     dump_top_k: int = 5,
+    use_bm25: bool = False,
+    rrf_k: int = 60,
 ) -> None:
     """Load benchmark, run retrieval for each variant, compute metrics, save results.
 
@@ -463,7 +474,11 @@ def run_eval(
 
     print(f"Loading retriever from: {db_path}")
     retriever = Retriever(db_path=db_path, model_name=embedding_model)
-    retrieve_fn = _make_retrieve_fn(retriever, course_code)
+    retrieve_fn = _make_retrieve_fn(
+        retriever, course_code, use_bm25=use_bm25, rrf_k=rrf_k
+    )
+    if use_bm25:
+        print(f"  Hybrid retrieval enabled (dense + BM25, RRF k={rrf_k})")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     results = []
@@ -603,6 +618,20 @@ def _parse_args() -> argparse.Namespace:
         help="How many retrieved pages to include in --dump-predictions (default 5).",
     )
     parser.add_argument(
+        "--use-bm25",
+        action="store_true",
+        help=(
+            "Combine dense retrieval with BM25 using Reciprocal Rank Fusion. "
+            "Often a free win on short-text corpora like slides."
+        ),
+    )
+    parser.add_argument(
+        "--rrf-k",
+        type=int,
+        default=60,
+        help="RRF k parameter when --use-bm25 is set (default 60).",
+    )
+    parser.add_argument(
         "--predictions-file",
         default=None,
         type=Path,
@@ -645,4 +674,6 @@ if __name__ == "__main__":
         seed=args.seed,
         dump_predictions=args.dump_predictions,
         dump_top_k=args.dump_top_k,
+        use_bm25=args.use_bm25,
+        rrf_k=args.rrf_k,
     )
