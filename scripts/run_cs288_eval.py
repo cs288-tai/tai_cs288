@@ -206,12 +206,15 @@ def _make_retrieve_fn(
     course_code: Optional[str],
     use_bm25: bool = False,
     rrf_k: int = 60,
+    chunk_agg: str = "max",
+    dense_weight: float = 1.0,
+    bm25_weight: float = 1.0,
 ):
     """Wrap retriever.retrieve into the callable expected by eval functions.
 
-    Signature expected by eval: (query, variant, course_code, top_k) -> results.
-    When ``use_bm25`` is True we let the retriever combine dense + BM25 with RRF;
-    short-text slide retrieval typically benefits from this hybrid.
+    Forwards all retrieval-tuning knobs (BM25 toggle, RRF k, chunk aggregator,
+    weighted RRF) so a single eval invocation can sweep these values without
+    touching the retriever code.
     """
     def retrieve_fn(query: str, variant: str, course_code: Optional[str], top_k: int):
         return retriever.retrieve(
@@ -221,6 +224,9 @@ def _make_retrieve_fn(
             top_k=top_k,
             use_bm25=use_bm25,
             rrf_k=rrf_k,
+            chunk_agg=chunk_agg,
+            dense_weight=dense_weight,
+            bm25_weight=bm25_weight,
         )
     return retrieve_fn
 
@@ -230,17 +236,28 @@ def _eval_subset(
     retrieve_fn,
     variant: str,
     course_code: Optional[str],
+    k_list: tuple[int, ...] = (1, 3, 5),
+    mrr_k: int = 5,
 ) -> dict[str, float]:
-    """Compute retrieval metrics over an arbitrary subset of questions."""
+    """Compute retrieval metrics over an arbitrary subset of questions.
+
+    Returns a dict with keys n, recall@<k> for each k in k_list, and mrr@<mrr_k>.
+    """
     if not questions:
-        return {"n": 0, "recall@1": 0.0, "recall@3": 0.0, "recall@5": 0.0, "mrr@5": 0.0}
-    return {
-        "n": len(questions),
-        "recall@1": round(recall_at_k(questions, retrieve_fn, variant, course_code, k=1), 4),
-        "recall@3": round(recall_at_k(questions, retrieve_fn, variant, course_code, k=3), 4),
-        "recall@5": round(recall_at_k(questions, retrieve_fn, variant, course_code, k=5), 4),
-        "mrr@5":    round(mrr(questions, retrieve_fn, variant, course_code, k=5), 4),
-    }
+        out: dict[str, float] = {"n": 0}
+        for k in k_list:
+            out[f"recall@{k}"] = 0.0
+        out[f"mrr@{mrr_k}"] = 0.0
+        return out
+    out = {"n": len(questions)}
+    for k in k_list:
+        out[f"recall@{k}"] = round(
+            recall_at_k(questions, retrieve_fn, variant, course_code, k=k), 4
+        )
+    out[f"mrr@{mrr_k}"] = round(
+        mrr(questions, retrieve_fn, variant, course_code, k=mrr_k), 4
+    )
+    return out
 
 
 def _eval_variant(
@@ -249,6 +266,8 @@ def _eval_variant(
     variant: str,
     course_code: Optional[str],
     predicted_answers: Optional[list[str]] = None,
+    k_list: tuple[int, ...] = (1, 3, 5),
+    mrr_k: int = 5,
 ) -> dict:
     """Compute all metrics for one variant. Returns a dict of metric → value.
 
@@ -261,52 +280,42 @@ def _eval_variant(
                             order as questions).  When provided, contains_answer_rate
                             is computed; otherwise reported as None (not run).
     """
-    _zero: dict = {
-        "variant": variant,
-        "n_questions": 0,
-        "recall@1": 0.0,
-        "recall@3": 0.0,
-        "recall@5": 0.0,
-        "mrr@5": 0.0,
-        # citation_hit_rate needs a QA agent — placeholder for now.
-        "citation_hit_rate": None,
-        # contains_answer_rate needs predicted answers from a QA model.
-        "contains_answer_rate": None,
-    }
     if not questions:
-        return _zero
+        zero: dict = {"variant": variant, "n_questions": 0}
+        for k in k_list:
+            zero[f"recall@{k}"] = 0.0
+        zero[f"mrr@{mrr_k}"] = 0.0
+        zero["citation_hit_rate"] = None
+        zero["contains_answer_rate"] = None
+        return zero
 
-    r1 = recall_at_k(questions, retrieve_fn, variant, course_code, k=1)
-    r3 = recall_at_k(questions, retrieve_fn, variant, course_code, k=3)
-    r5 = recall_at_k(questions, retrieve_fn, variant, course_code, k=5)
-    mrr5 = mrr(questions, retrieve_fn, variant, course_code, k=5)
+    out: dict = {"variant": variant, "n_questions": len(questions)}
+    for k in k_list:
+        out[f"recall@{k}"] = round(
+            recall_at_k(questions, retrieve_fn, variant, course_code, k=k), 4
+        )
+    out[f"mrr@{mrr_k}"] = round(
+        mrr(questions, retrieve_fn, variant, course_code, k=mrr_k), 4
+    )
 
     # Answer-level metric: only computed when predicted answers are supplied.
     ca_rate: Optional[float] = None
     if predicted_answers is not None:
         ca_rate = round(contains_answer_rate(questions, predicted_answers), 4)
 
-    # Per-type breakdown (R@k, MRR@5 within each question_type bucket).
+    # Per-type breakdown (R@k for each k in k_list, MRR@<mrr_k> per type).
     by_type: dict[str, list[dict]] = defaultdict(list)
     for q in questions:
         by_type[q.get("question_type", "unknown")].append(q)
     per_type = {
-        qtype: _eval_subset(qs, retrieve_fn, variant, course_code)
+        qtype: _eval_subset(qs, retrieve_fn, variant, course_code, k_list, mrr_k)
         for qtype, qs in sorted(by_type.items())
     }
 
-    return {
-        "variant": variant,
-        "n_questions": len(questions),
-        "recall@1": round(r1, 4),
-        "recall@3": round(r3, 4),
-        "recall@5": round(r5, 4),
-        "mrr@5": round(mrr5, 4),
-        # citation_hit_rate needs a QA agent — placeholder for now.
-        "citation_hit_rate": None,
-        "contains_answer_rate": ca_rate,
-        "per_type": per_type,
-    }
+    out["citation_hit_rate"] = None
+    out["contains_answer_rate"] = ca_rate
+    out["per_type"] = per_type
+    return out
 
 
 def _fmt(val: Optional[float], width: int = 8) -> str:
@@ -316,20 +325,26 @@ def _fmt(val: Optional[float], width: int = 8) -> str:
     return f"{val:>{width}.4f}"
 
 
-def _print_table(results: list[dict]) -> None:
+def _print_table(
+    results: list[dict],
+    k_list: tuple[int, ...] = (1, 3, 5),
+    mrr_k: int = 5,
+) -> None:
     """Print a readable summary table (overall + per-type) to stdout."""
-    header = (
-        f"{'Variant':<10} {'N':>6} {'R@1':>7} {'R@3':>7} {'R@5':>7}"
-        f" {'MRR@5':>8} {'ContainsAns':>12}"
-    )
+    rk_keys = [f"recall@{k}" for k in k_list]
+    mrr_key = f"mrr@{mrr_k}"
+
+    header_parts = [f"{'Variant':<10}", f"{'N':>6}"]
+    header_parts += [f"{'R@'+str(k):>7}" for k in k_list]
+    header_parts += [f"{mrr_key.upper():>8}", f"{'ContainsAns':>12}"]
+    header = " ".join(header_parts)
     print("\n" + header)
     print("-" * len(header))
     for r in results:
-        print(
-            f"{r['variant']:<10} {r['n_questions']:>6} "
-            f"{_fmt(r['recall@1'], 7)} {_fmt(r['recall@3'], 7)} {_fmt(r['recall@5'], 7)}"
-            f" {_fmt(r['mrr@5'], 8)} {_fmt(r['contains_answer_rate'], 12)}"
-        )
+        row = [f"{r['variant']:<10}", f"{r['n_questions']:>6}"]
+        row += [_fmt(r.get(k), 7) for k in rk_keys]
+        row += [_fmt(r.get(mrr_key), 8), _fmt(r.get("contains_answer_rate"), 12)]
+        print(" ".join(row))
 
     # Per-type breakdown — only print when we have it.
     have_per_type = any(r.get("per_type") for r in results)
@@ -337,21 +352,20 @@ def _print_table(results: list[dict]) -> None:
         print()
         return
 
-    sub_header = (
-        f"{'Variant':<10} {'Type':<10} {'N':>6} "
-        f"{'R@1':>7} {'R@3':>7} {'R@5':>7} {'MRR@5':>8}"
-    )
+    sub_parts = [f"{'Variant':<10}", f"{'Type':<10}", f"{'N':>6}"]
+    sub_parts += [f"{'R@'+str(k):>7}" for k in k_list]
+    sub_parts += [f"{mrr_key.upper():>8}"]
+    sub_header = " ".join(sub_parts)
     print("\n" + sub_header)
     print("-" * len(sub_header))
     for r in results:
         per_type = r.get("per_type") or {}
         for qtype in sorted(per_type.keys()):
             m = per_type[qtype]
-            print(
-                f"{r['variant']:<10} {qtype:<10} {m['n']:>6} "
-                f"{_fmt(m['recall@1'], 7)} {_fmt(m['recall@3'], 7)} "
-                f"{_fmt(m['recall@5'], 7)} {_fmt(m['mrr@5'], 8)}"
-            )
+            row = [f"{r['variant']:<10}", f"{qtype:<10}", f"{m['n']:>6}"]
+            row += [_fmt(m.get(k), 7) for k in rk_keys]
+            row += [_fmt(m.get(mrr_key), 8)]
+            print(" ".join(row))
     print()
 
 
@@ -448,6 +462,11 @@ def run_eval(
     dump_top_k: int = 5,
     use_bm25: bool = False,
     rrf_k: int = 60,
+    chunk_agg: str = "max",
+    dense_weight: float = 1.0,
+    bm25_weight: float = 1.0,
+    k_list: tuple[int, ...] = (1, 3, 5),
+    mrr_k: int = 5,
 ) -> None:
     """Load benchmark, run retrieval for each variant, compute metrics, save results.
 
@@ -475,10 +494,19 @@ def run_eval(
     print(f"Loading retriever from: {db_path}")
     retriever = Retriever(db_path=db_path, model_name=embedding_model)
     retrieve_fn = _make_retrieve_fn(
-        retriever, course_code, use_bm25=use_bm25, rrf_k=rrf_k
+        retriever,
+        course_code,
+        use_bm25=use_bm25,
+        rrf_k=rrf_k,
+        chunk_agg=chunk_agg,
+        dense_weight=dense_weight,
+        bm25_weight=bm25_weight,
     )
-    if use_bm25:
-        print(f"  Hybrid retrieval enabled (dense + BM25, RRF k={rrf_k})")
+    print(
+        f"  Retrieval config: dense_weight={dense_weight} bm25_weight={bm25_weight} "
+        f"use_bm25={use_bm25} rrf_k={rrf_k} chunk_agg={chunk_agg}"
+    )
+    print(f"  k_list={list(k_list)} mrr_k={mrr_k}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     results = []
@@ -505,11 +533,18 @@ def run_eval(
                 for q in variant_qs
             ]
 
-        metrics = _eval_variant(variant_qs, retrieve_fn, variant, course_code, predicted)
+        metrics = _eval_variant(
+            variant_qs, retrieve_fn, variant, course_code, predicted,
+            k_list=k_list, mrr_k=mrr_k,
+        )
         results.append(metrics)
-        print(f"  Recall@1={metrics['recall@1']}  Recall@3={metrics['recall@3']}  "
-              f"Recall@5={metrics['recall@5']}  MRR@5={metrics['mrr@5']}  "
-              f"ContainsAns={metrics['contains_answer_rate']}")
+        rk_str = "  ".join(
+            f"R@{k}={metrics.get(f'recall@{k}')}" for k in k_list
+        )
+        print(
+            f"  {rk_str}  MRR@{mrr_k}={metrics.get(f'mrr@{mrr_k}')}  "
+            f"ContainsAns={metrics.get('contains_answer_rate')}"
+        )
 
         if dump_predictions:
             dump_path = (output_dir / f"predictions_{variant}.jsonl").resolve()
@@ -528,7 +563,7 @@ def run_eval(
             except OSError as e:
                 print(f"    WARNING: dump file not found after write: {e}")
 
-    _print_table(results)
+    _print_table(results, k_list=k_list, mrr_k=mrr_k)
 
     json_out = _save_json(results, output_dir)
     csv_out = _save_csv(results, output_dir)
@@ -632,6 +667,47 @@ def _parse_args() -> argparse.Namespace:
         help="RRF k parameter when --use-bm25 is set (default 60).",
     )
     parser.add_argument(
+        "--dense-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Weight on the dense ranker in weighted RRF (default 1.0). "
+            "Only used when --use-bm25 is set. Combine with --bm25-weight to "
+            "trade off the two rankers; e.g. 2.0 / 1.0 favours dense, "
+            "1.0 / 0.0 disables BM25 (same as omitting --use-bm25)."
+        ),
+    )
+    parser.add_argument(
+        "--bm25-weight",
+        type=float,
+        default=1.0,
+        help="Weight on the BM25 ranker in weighted RRF (default 1.0).",
+    )
+    parser.add_argument(
+        "--chunk-agg",
+        choices=("max", "sum", "mean"),
+        default="max",
+        help=(
+            "How to aggregate per-chunk scores into a per-page score when the "
+            "index is chunk-level (default: max). 'mean' averages chunk scores; "
+            "'sum' adds them (favours pages with many chunks)."
+        ),
+    )
+    parser.add_argument(
+        "--k-list",
+        default="1,3,5",
+        help=(
+            "Comma-separated list of k values for Recall@k (default '1,3,5'). "
+            "Add larger k to inspect tail behaviour, e.g. '1,3,5,10,20'."
+        ),
+    )
+    parser.add_argument(
+        "--mrr-k",
+        type=int,
+        default=5,
+        help="Cutoff for MRR@k (default 5).",
+    )
+    parser.add_argument(
         "--predictions-file",
         default=None,
         type=Path,
@@ -676,4 +752,9 @@ if __name__ == "__main__":
         dump_top_k=args.dump_top_k,
         use_bm25=args.use_bm25,
         rrf_k=args.rrf_k,
+        chunk_agg=args.chunk_agg,
+        dense_weight=args.dense_weight,
+        bm25_weight=args.bm25_weight,
+        k_list=tuple(int(k) for k in args.k_list.split(",") if k.strip()),
+        mrr_k=args.mrr_k,
     )

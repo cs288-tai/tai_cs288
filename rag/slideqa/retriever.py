@@ -114,6 +114,8 @@ class Retriever:
         use_bm25: bool = False,
         rrf_k: int = 60,
         chunk_agg: str = "max",
+        dense_weight: float = 1.0,
+        bm25_weight: float = 1.0,
     ) -> list[SlidePageResult]:
         """Return top_k SlidePageResult sorted by score descending.
 
@@ -169,7 +171,8 @@ class Retriever:
             page_idx = {"page_ids": page_ids, "metadata": metadata}
             bm25_raw = self._compute_bm25(query, page_idx)
             final_scores, bm25_scores_map = self._combine_rrf(
-                dense_scores, page_ids, bm25_raw, rrf_k
+                dense_scores, page_ids, bm25_raw, rrf_k,
+                dense_weight=dense_weight, bm25_weight=bm25_weight,
             )
         else:
             final_scores = dense_scores
@@ -480,8 +483,10 @@ class Retriever:
         page_ids: list[str],
         bm25_scores: dict[str, float],
         rrf_k: int,
+        dense_weight: float = 1.0,
+        bm25_weight: float = 1.0,
     ) -> tuple[np.ndarray, dict[str, float]]:
-        """Combine dense and BM25 scores via Reciprocal Rank Fusion."""
+        """Combine dense and BM25 scores via (weighted) Reciprocal Rank Fusion."""
         n = len(page_ids)
 
         # Build dense rank dict (1-indexed, rank 1 = highest score)
@@ -493,7 +498,10 @@ class Retriever:
         bm25_sorted = sorted(bm25_vals, key=lambda x: x[1], reverse=True)
         bm25_ranks: dict[str, int] = {pid: r + 1 for r, (pid, _) in enumerate(bm25_sorted)}
 
-        rrf_scores = self._rrf_combine(dense_ranks, bm25_ranks, rrf_k)
+        rrf_scores = self._rrf_combine(
+            dense_ranks, bm25_ranks, rrf_k,
+            dense_weight=dense_weight, bm25_weight=bm25_weight,
+        )
 
         combined = np.array(
             [rrf_scores.get(pid, 0.0) for pid in page_ids], dtype=np.float32
@@ -505,16 +513,24 @@ class Retriever:
         dense_ranks: dict[str, int],
         bm25_ranks: dict[str, int],
         k: int,
+        dense_weight: float = 1.0,
+        bm25_weight: float = 1.0,
     ) -> dict[str, float]:
         """
-        Reciprocal Rank Fusion over two rank dicts.
+        Weighted Reciprocal Rank Fusion over two rank dicts.
 
-        Score = 1/(k + rank_dense) + 1/(k + rank_bm25)
+        Score = dense_weight / (k + rank_dense) + bm25_weight / (k + rank_bm25)
+
+        Equal weights (1.0, 1.0) recovers vanilla RRF. Set bm25_weight=0 for
+        dense-only with the same code path; set dense_weight=0 for BM25-only.
         """
         all_ids = set(dense_ranks) | set(bm25_ranks)
         scores: dict[str, float] = {}
         for pid in all_ids:
             r_dense = dense_ranks.get(pid, len(dense_ranks) + 1)
             r_bm25 = bm25_ranks.get(pid, len(bm25_ranks) + 1)
-            scores[pid] = 1.0 / (k + r_dense) + 1.0 / (k + r_bm25)
+            scores[pid] = (
+                dense_weight / (k + r_dense)
+                + bm25_weight / (k + r_bm25)
+            )
         return scores
