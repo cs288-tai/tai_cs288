@@ -96,6 +96,8 @@ class Retriever:
         self._db_path = resolved
         self._model_name = model_name
         self._model: Any = None  # lazy-loaded SentenceTransformer
+        self._reranker: Any = None  # lazy-loaded CrossEncoder (reranker)
+        self._reranker_name: Optional[str] = None
         # Bounded LRU cache: (variant, course_code) -> index dict
         self._index_cache: dict[tuple[str, Optional[str]], dict[str, Any]] = {}
         self._cache_order: list[tuple[str, Optional[str]]] = []  # LRU eviction order
@@ -116,6 +118,8 @@ class Retriever:
         chunk_agg: str = "max",
         dense_weight: float = 1.0,
         bm25_weight: float = 1.0,
+        reranker_model: Optional[str] = None,
+        rerank_pool: int = 30,
     ) -> list[SlidePageResult]:
         """Return top_k SlidePageResult sorted by score descending.
 
@@ -178,10 +182,33 @@ class Retriever:
             final_scores = dense_scores
             bm25_scores_map: dict[str, float] = {}
 
-        # 6. Rank and return top_k
+        # 6. Rank.
+        # If a reranker is configured, first take the top-`rerank_pool` candidates
+        # by first-stage score, run a cross-encoder over (query, candidate_text),
+        # and keep the top-`top_k` by reranker score. Otherwise, take top-`top_k`
+        # directly from `final_scores`.
         n = len(page_ids)
         k = min(top_k, n)
-        if k == n:
+
+        if reranker_model:
+            pool = max(k, min(rerank_pool, n))
+            pool_idx = np.argpartition(final_scores, -pool)[-pool:]
+            pool_idx = pool_idx[np.argsort(final_scores[pool_idx])[::-1]]
+
+            ce = self._get_reranker(reranker_model)
+            pairs = [(query, metadata[i].get("rerank_text") or metadata[i]["ocr_text"])
+                     for i in pool_idx]
+            ce_scores = ce.predict(pairs)
+            reranked_order = np.argsort(np.asarray(ce_scores))[::-1][:k]
+            top_idx = pool_idx[reranked_order]
+
+            # Replace `final_scores` for the reranked subset with CE scores so
+            # the returned SlidePageResult.score reflects the reranker's verdict.
+            for rank_pos, (i, ce_score) in enumerate(
+                zip(top_idx, np.asarray(ce_scores)[reranked_order]), start=0
+            ):
+                final_scores[i] = float(ce_score)
+        elif k == n:
             top_idx = np.argsort(final_scores)[::-1]
         else:
             top_idx = np.argpartition(final_scores, -k)[-k:]
@@ -221,6 +248,21 @@ class Retriever:
             logger.info("Loading embedding model %s", self._model_name)
             self._model = SentenceTransformer(self._model_name)
         return self._model
+
+    def _get_reranker(self, model_name: str) -> Any:
+        """Lazy-load (and cache) a CrossEncoder reranker.
+
+        The cache is keyed on the model name so calling `retrieve` repeatedly
+        with the same reranker doesn't reload weights every query, but
+        switching reranker mid-process is supported.
+        """
+        if self._reranker is None or self._reranker_name != model_name:
+            from sentence_transformers import CrossEncoder  # type: ignore
+
+            logger.info("Loading reranker %s", model_name)
+            self._reranker = CrossEncoder(model_name)
+            self._reranker_name = model_name
+        return self._reranker
 
     def _read_db_version(self) -> str:
         """
@@ -339,6 +381,13 @@ class Retriever:
                     objects = None
 
             page_ids.append(row["page_id"])
+            row_keys = row.keys()
+            # Prefer the variant-specific chunk_text when available (chunk index);
+            # fall back to slide_pages.ocr_text otherwise.
+            if "chunk_text" in row_keys and row["chunk_text"]:
+                rerank_text = row["chunk_text"]
+            else:
+                rerank_text = row["ocr_text"] or ""
             metadata.append(
                 {
                     "course_code": row["course_code"],
@@ -346,8 +395,9 @@ class Retriever:
                     "page_number": row["page_number"],
                     "image_path": row["image_path"],
                     "ocr_text": row["ocr_text"] or "",
-                    "caption": row["caption"] if "caption" in row.keys() else None,
+                    "caption": row["caption"] if "caption" in row_keys else None,
                     "objects": objects,
+                    "rerank_text": rerank_text,
                 }
             )
             vectors.append(vec)
@@ -368,11 +418,16 @@ class Retriever:
     def _fetch_chunk_rows(
         conn: sqlite3.Connection, variant: str, course_code: Optional[str]
     ) -> tuple[list[Any], bool]:
-        """Fetch rows from slide_chunks joined to slide_pages."""
+        """Fetch rows from slide_chunks joined to slide_pages.
+
+        We surface ``sc.chunk_text`` as well so downstream consumers (e.g. a
+        cross-encoder reranker) can score the variant-specific chunk content
+        rather than the canonical v1 ``ocr_text`` stored on slide_pages.
+        """
         sql = (
             "SELECT sp.page_id, sp.course_code, sp.lecture_id, "
             "sp.page_number, sp.image_path, sp.ocr_text, sp.caption, sp.objects, "
-            "sc.vector "
+            "sc.vector, sc.chunk_text "
             "FROM slide_chunks sc "
             "JOIN slide_pages sp ON sc.page_id = sp.page_id "
             "WHERE sc.variant = ?"

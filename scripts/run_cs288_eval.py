@@ -209,6 +209,8 @@ def _make_retrieve_fn(
     chunk_agg: str = "max",
     dense_weight: float = 1.0,
     bm25_weight: float = 1.0,
+    reranker_model: Optional[str] = None,
+    rerank_pool: int = 30,
 ):
     """Wrap retriever.retrieve into the callable expected by eval functions.
 
@@ -227,6 +229,8 @@ def _make_retrieve_fn(
             chunk_agg=chunk_agg,
             dense_weight=dense_weight,
             bm25_weight=bm25_weight,
+            reranker_model=reranker_model,
+            rerank_pool=rerank_pool,
         )
     return retrieve_fn
 
@@ -465,6 +469,8 @@ def run_eval(
     chunk_agg: str = "max",
     dense_weight: float = 1.0,
     bm25_weight: float = 1.0,
+    reranker_model: Optional[str] = None,
+    rerank_pool: int = 30,
     k_list: tuple[int, ...] = (1, 3, 5),
     mrr_k: int = 5,
 ) -> None:
@@ -501,11 +507,15 @@ def run_eval(
         chunk_agg=chunk_agg,
         dense_weight=dense_weight,
         bm25_weight=bm25_weight,
+        reranker_model=reranker_model,
+        rerank_pool=rerank_pool,
     )
     print(
         f"  Retrieval config: dense_weight={dense_weight} bm25_weight={bm25_weight} "
         f"use_bm25={use_bm25} rrf_k={rrf_k} chunk_agg={chunk_agg}"
     )
+    if reranker_model:
+        print(f"  Reranker: {reranker_model}  pool={rerank_pool}")
     print(f"  k_list={list(k_list)} mrr_k={mrr_k}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -708,6 +718,25 @@ def _parse_args() -> argparse.Namespace:
         help="Cutoff for MRR@k (default 5).",
     )
     parser.add_argument(
+        "--reranker-model",
+        default=None,
+        help=(
+            "If set, use a CrossEncoder reranker on the top --rerank-pool "
+            "first-stage candidates. For our bge-m3 first-stage the matched "
+            "reranker is 'BAAI/bge-reranker-v2-m3'. Other options: "
+            "'cross-encoder/ms-marco-MiniLM-L-6-v2' (faster, weaker)."
+        ),
+    )
+    parser.add_argument(
+        "--rerank-pool",
+        type=int,
+        default=30,
+        help=(
+            "How many first-stage candidates to feed the reranker (default 30). "
+            "Larger pool -> better ceiling, slower per query."
+        ),
+    )
+    parser.add_argument(
         "--predictions-file",
         default=None,
         type=Path,
@@ -755,6 +784,8 @@ if __name__ == "__main__":
         chunk_agg=args.chunk_agg,
         dense_weight=args.dense_weight,
         bm25_weight=args.bm25_weight,
+        reranker_model=args.reranker_model,
+        rerank_pool=args.rerank_pool,
         k_list=tuple(int(k) for k in args.k_list.split(",") if k.strip()),
         mrr_k=args.mrr_k,
     )
