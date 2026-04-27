@@ -435,7 +435,7 @@ def run_eval(
     max_per_type: Optional[int] = None,
     question_types: Optional[set[str]] = None,
     seed: int = 0,
-    dump_predictions: bool = False,
+    dump_predictions: bool = True,
     dump_top_k: int = 5,
 ) -> None:
     """Load benchmark, run retrieval for each variant, compute metrics, save results.
@@ -497,8 +497,8 @@ def run_eval(
               f"ContainsAns={metrics['contains_answer_rate']}")
 
         if dump_predictions:
-            dump_path = output_dir / f"predictions_{variant}.jsonl"
-            print(f"  Dumping per-question retrieval details → {dump_path}")
+            dump_path = (output_dir / f"predictions_{variant}.jsonl").resolve()
+            print(f"  Dumping per-question retrieval details -> {dump_path}")
             _dump_predictions(
                 variant_qs,
                 retrieve_fn,
@@ -507,6 +507,11 @@ def run_eval(
                 dump_path,
                 top_k=dump_top_k,
             )
+            try:
+                size = dump_path.stat().st_size
+                print(f"    wrote {size:,} bytes ({len(variant_qs)} questions)")
+            except OSError as e:
+                print(f"    WARNING: dump file not found after write: {e}")
 
     _print_table(results)
 
@@ -580,13 +585,15 @@ def _parse_args() -> argparse.Namespace:
         help="Random seed for stratified sampling (default: 0).",
     )
     parser.add_argument(
-        "--dump-predictions",
-        action="store_true",
+        "--no-dump-predictions",
+        dest="dump_predictions",
+        action="store_false",
+        default=True,
         help=(
-            "If set, write a JSONL of per-question retrieval details to "
-            "<output-dir>/predictions_<variant>.jsonl (one file per variant). "
-            "Each line includes the question, gold page ids, top-K retrieved "
-            "pages with snippets, and the rank of the first gold hit."
+            "Disable the default per-question retrieval dump. By default the "
+            "script writes <output-dir>/predictions_<variant>.jsonl for each "
+            "variant, with the question, gold page ids, top-K retrieved pages "
+            "(plus snippets), and the rank of the first gold hit."
         ),
     )
     parser.add_argument(
